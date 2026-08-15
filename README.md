@@ -52,12 +52,16 @@ dsh-rpc workspaces                      list workspaces
 dsh-rpc sessions                        list sessions
 dsh-rpc run <task…> [opts]              create a grouped session, send task, wait, print result
       --workspace,-w <path>             target workspace dir (default: cwd)
+      --permission,-p <mode>            set+verify the session permission before the task:
+                                        read-only | workspace-write | danger-full-access
+      --allow-danger-full-access        required acknowledgement for danger-full-access
       --no-wait                         return the session id immediately
-      --timeout <sec>                   max wait (default 600)
+      --timeout <sec>                   max wait, then cancel (default 600)
       --quiet,-q                        suppress progress
 dsh-rpc prompt <sessionId> [opts] <text…>  send a follow-up to an existing session
       --wait                            wait for completion and print the result
-      --timeout <sec>                   max wait (default 600)
+      --permission,-p <mode>            (optional) change the permission first
+      --timeout <sec>                   max wait, then cancel (default 600)
 dsh-rpc history <sessionId>             print a session's messages
 dsh-rpc call <method> [json]            raw RPC escape hatch
 ```
@@ -74,6 +78,12 @@ dsh-rpc run "refactor the logger" --workspace /path/to/my/project --no-wait
 
 # Follow up in the same session
 dsh-rpc prompt session-xxxx --wait "commit the passing tests"
+
+# Constrain a run to read-only (permission is applied + verified before the task)
+dsh-rpc run "audit the codebase for TODOs" --permission read-only
+
+# A write task needs the wider preset explicitly
+dsh-rpc run "add a CHANGELOG entry" --permission workspace-write
 
 # Inspect
 dsh-rpc sessions
@@ -111,13 +121,36 @@ loopback-only by design.
 
 Methods used here: `workspace.list`, `workspace.create`, `workspace.delete`,
 `session.create` (passing `workspaceId` attaches/groups the session),
-`session.prompt`, `session.list` (carries the `running` flag), and
-`session.history`.
+`session.prompt`, `session.list` (carries the `running` flag),
+`session.history`, `session.cancel`, and `commands/execute` (permission presets).
 
 **Completion detection** polls `session.list` for the session's `running` flag
 (the same signal the host broadcasts over the `/api/events.host` WebSocket),
 then reads the final assistant message via `session.history`. This keeps the
 tool dependency-free — no WebSocket client required.
+
+## Safety features
+
+These opt-in guards harden unattended runs. They are additive — the default
+`run`/`prompt` behavior is unchanged.
+
+- **Permission control** (`--permission`). The preset is applied through
+  `commands/execute` (`/permission <mode>`) and **verified** against the
+  session's `permissions` projection before the task is submitted.
+  `danger-full-access` additionally requires `--allow-danger-full-access`.
+- **Stronger completion gate.** On finish, the latest `turn/end` event is
+  checked; a terminal reason other than `completed` is surfaced as an error.
+- **Approval detection.** If the session raises an unresolved approval request
+  while waiting, it is cancelled rather than left hanging.
+- **Cancel-on-timeout.** A timeout cancels the session instead of merely
+  stopping the wait.
+
+## Credits
+
+The permission-via-`commands/execute` technique, the `turn/end: completed`
+completion gate, and the approval/timeout-cancel behavior were adapted from
+[jnsys](https://github.com/jnsys)'s guarded-runner proposal
+([issue #1 / PR #2](https://github.com/Klng79/dsh-rpc/pull/2)). Thanks, jnsys!
 
 ## Verified against
 

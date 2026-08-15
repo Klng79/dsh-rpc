@@ -20,6 +20,12 @@
  * authority (127.0.0.1 / localhost) or a declared --trusted-host. Running locally,
  * plain fetch to 127.0.0.1 passes automatically. No auth layer exists (loopback only).
  *
+ * Safety features adapted from jnsys's guarded-runner proposal
+ * (https://github.com/jnsys/dsh-rpc, PR on Klng79/dsh-rpc): permission is set via
+ * the `commands/execute` RPC + verified against the `permissions` projection;
+ * completion requires a `turn/end` with reason "completed"; pending approvals and
+ * timeouts cancel the session instead of leaving it running.
+ *
  * Environment:
  *   DSH_URL       server base url        (default http://127.0.0.1:3080)
  *   DSH_POLL_MS   completion poll period (default 1000)
@@ -30,6 +36,7 @@
 
 const BASE = process.env.DSH_URL || 'http://127.0.0.1:3080';
 const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
+const KNOWN_PERMISSIONS = ['read-only', 'workspace-write', 'danger-full-access'];
 
 function uuid() {
   const c = globalThis.crypto;
@@ -115,28 +122,98 @@ function finalAssistantText(history) {
   return '';
 }
 
+/* ---- safety helpers (adapted from jnsys's guarded-runner) ---- */
+
+function currentPermission(history) {
+  const proj = history && history.projections && history.projections.values && history.projections.values.permissions;
+  if (proj && typeof proj.currentValue === 'string') return proj.currentValue;
+  const events = (history && history.events) || [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i].event || events[i];
+    if (ev.type === 'permission/preset' && ev.data && typeof ev.data.preset === 'string') return ev.data.preset;
+  }
+  return undefined;
+}
+
+function latestTurnEnd(history) {
+  const events = (history && history.events) || [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i].event || events[i];
+    if (ev.type === 'turn/end') return ev;
+  }
+  return undefined;
+}
+
+function pendingApproval(history) {
+  const pending = new Map();
+  for (const entry of (history && history.events) || []) {
+    const ev = entry.event || entry;
+    if (ev.type === 'approval/asked' && ev.data && ev.data.id) pending.set(ev.data.id, ev.data);
+    else if (ev.type === 'approval/decided' && ev.data && ev.data.id) pending.delete(ev.data.id);
+  }
+  const first = pending.values().next();
+  return first.done ? undefined : first.value;
+}
+
+function cancelSession(sessionId) {
+  return rpc('session.cancel', { sessionId });
+}
+
+async function applyAndVerifyPermission(sessionId, permission) {
+  const exec = await rpc('commands/execute', {
+    args: { agentId: sessionId, line: `/permission ${permission}` },
+  });
+  if (!exec || !exec.result || exec.result.kind !== 'success') {
+    const detail = exec && exec.result && exec.result.text ? `: ${exec.result.text}` : '';
+    throw new Error(`could not set permission "${permission}" for ${sessionId}${detail}`);
+  }
+  const history = await getHistory(sessionId);
+  const actual = currentPermission(history);
+  if (actual && actual !== permission) {
+    throw new Error(`permission verification failed for ${sessionId}: expected ${permission}, got ${actual}`);
+  }
+}
+
 async function waitForCompletion(sessionId, timeoutMs, quiet) {
   const deadline = Date.now() + timeoutMs;
   const start = Date.now();
   let sawRunning = false;
   while (Date.now() < deadline) {
     let summary;
+    let history;
     try {
       const list = await rpc('session.list', {});
       summary = (list.items || []).find((i) => i.sessionId === sessionId);
+      history = await getHistory(sessionId);
     } catch (e) {
       /* transient server hiccup — keep polling */
     }
+    if (history) {
+      const approval = pendingApproval(history);
+      if (approval) {
+        await cancelSession(sessionId).catch(() => {});
+        throw new Error(`session requested approval for ${approval.toolName || 'an operation'}; cancelled`);
+      }
+    }
     if (summary && summary.running) sawRunning = true;
     const graceDone = sawRunning || (Date.now() - start > 3000);
-    if (summary && summary.running === false && graceDone) return;
+    if (summary && summary.running === false && graceDone) {
+      // stronger completion gate: surface a non-"completed" terminal reason
+      const turnEnd = history ? latestTurnEnd(history) : undefined;
+      const kind = turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : undefined;
+      if (kind && kind !== 'completed') {
+        throw new Error(`session ended with reason "${kind}" (not completed)`);
+      }
+      return;
+    }
     if (!quiet) {
       const secs = Math.round((Date.now() - start) / 1000);
       process.stderr.write(`\r  dsh working… ${secs}s${summary && summary.running ? ' (running)' : ''}   `);
     }
     await sleep(POLL_MS);
   }
-  throw new Error(`timed out after ${timeoutMs}ms waiting for session ${sessionId}`);
+  await cancelSession(sessionId).catch(() => {});
+  throw new Error(`timed out after ${timeoutMs}ms; cancelled session ${sessionId}`);
 }
 
 /* ---- commands ---- */
@@ -164,18 +241,23 @@ async function cmdRun(args) {
   let workspacePath = null;
   let wait = true;
   let quiet = false;
+  let permission = null;
+  let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
   const taskParts = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--workspace' || a === '-w') { workspacePath = args[++i]; }
+    else if (a === '--permission' || a === '-p') { permission = args[++i]; }
+    else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--no-wait') { wait = false; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
     else if (a === '--timeout') { timeoutMs = Number(args[++i]) * 1000; }
     else { taskParts.push(a); }
   }
   const task = taskParts.join(' ').trim();
-  if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--no-wait] [--timeout <sec>]');
+  if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--permission <mode>] [--no-wait] [--timeout <sec>]');
+  if (permission) validatePermission(permission, allowDangerFullAccess);
 
   const absPath = resolvePath(workspacePath);
   const workspace = await ensureWorkspace(absPath);
@@ -184,40 +266,53 @@ async function cmdRun(args) {
   const sessionId = created.sessionId;
   if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
 
-  await rpc('session.prompt', {
-    sessionId,
-    mode: 'queue',
-    content: [{ type: 'text', text: task }],
-  });
-
-  if (!wait) {
-    console.log(sessionId);
-    return;
+  try {
+    if (permission) {
+      await applyAndVerifyPermission(sessionId, permission);
+      if (!quiet) console.error(`verified permission ${permission}`);
+    }
+    await rpc('session.prompt', {
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: task }],
+    });
+    if (!wait) {
+      console.log(sessionId);
+      return;
+    }
+    await waitForCompletion(sessionId, timeoutMs, quiet);
+    if (!quiet) process.stderr.write('\n');
+    const history = await getHistory(sessionId);
+    const text = finalAssistantText(history);
+    console.log(text || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
+    console.error(`\n[done] session ${sessionId}`);
+  } catch (e) {
+    await cancelSession(sessionId).catch(() => {});
+    throw e;
   }
-
-  await waitForCompletion(sessionId, timeoutMs, quiet);
-  if (!quiet) process.stderr.write('\n');
-  const history = await getHistory(sessionId);
-  const text = finalAssistantText(history);
-  console.log(text || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
-  console.error(`\n[done] session ${sessionId}`);
 }
 
 async function cmdPrompt(args) {
   let wait = false;
   let quiet = false;
+  let permission = null;
+  let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
   const rest = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--wait') { wait = true; }
+    else if (a === '--permission' || a === '-p') { permission = args[++i]; }
+    else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
     else if (a === '--timeout') { timeoutMs = Number(args[++i]) * 1000; }
     else { rest.push(a); }
   }
   const sessionId = rest[0];
   const text = rest.slice(1).join(' ').trim();
-  if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--timeout <sec>] [--quiet] <text…>');
+  if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--permission <mode>] [--timeout <sec>] [--quiet] <text…>');
+  if (permission) validatePermission(permission, allowDangerFullAccess);
+  if (permission) await applyAndVerifyPermission(sessionId, permission);
   await rpc('session.prompt', {
     sessionId,
     mode: 'queue',
@@ -232,6 +327,15 @@ async function cmdPrompt(args) {
   const history = await getHistory(sessionId);
   console.log(finalAssistantText(history) || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
   console.error(`\n[done] session ${sessionId}`);
+}
+
+function validatePermission(permission, allowDangerFullAccess) {
+  if (!KNOWN_PERMISSIONS.includes(permission)) {
+    throw new Error(`unknown permission "${permission}"; expected one of: ${KNOWN_PERMISSIONS.join(', ')}`);
+  }
+  if (permission === 'danger-full-access' && !allowDangerFullAccess) {
+    throw new Error('permission danger-full-access requires the explicit --allow-danger-full-access acknowledgement');
+  }
 }
 
 async function cmdHistory(args) {
@@ -271,17 +375,26 @@ Usage:
   dsh-rpc sessions                         list sessions
   dsh-rpc run <task…> [opts]               create a grouped session, send task, wait, print result
        --workspace,-w <path>               target workspace dir (default: cwd)
+       --permission,-p <mode>              set+verify session permission before the task:
+                                           read-only | workspace-write | danger-full-access
+       --allow-danger-full-access          required acknowledgement for danger-full-access
        --no-wait                           return the session id immediately
-       --timeout <sec>                     max wait (default 600)
+       --timeout <sec>                     max wait, then cancel (default 600)
        --quiet,-q                          suppress progress
   dsh-rpc prompt <sessionId> <text…>       send a prompt to an existing session
+       --wait [--permission <mode>] [--timeout <sec>] [--quiet]
   dsh-rpc history <sessionId>              print a session's messages
   dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session.list '{}')
 
 Env: DSH_URL (default http://127.0.0.1:3080), DSH_POLL_MS (default 1000)
 
 Grouped-session guarantee: sessions are created through the same /api path the
-web UI uses, so they appear under their workspace (not as "ungrouped").`;
+web UI uses, so they appear under their workspace (not as "ungrouped").
+
+Safety behavior: with --permission the preset is applied via commands/execute and
+verified before the task is submitted; completion requires a turn/end with reason
+"completed"; a pending approval or a timeout cancels the session instead of
+leaving it running.`;
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
