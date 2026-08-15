@@ -44,6 +44,16 @@ safety-related breaking changes.
 install -m 0755 dsh-rpc ~/.local/bin/dsh-rpc
 ```
 
+Verify that the active command is this guarded build:
+
+```sh
+command -v dsh-rpc
+dsh-rpc --version
+```
+
+The version output must identify `jnsys-guarded-1` and the
+`https://github.com/jnsys/dsh-rpc` source.
+
 ## Guarded run
 
 ```text

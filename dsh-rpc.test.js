@@ -185,3 +185,10 @@ test('does not expose the original unrestricted raw RPC command', async () => {
   assert.equal(result.code, 1);
   assert.match(result.stderr, /unknown command: call/);
 });
+
+test('identifies the guarded jnsys build', async () => {
+  const result = await runCli('http://127.0.0.1:1', ['--version']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^dsh-rpc jnsys-guarded-1$/m);
+  assert.match(result.stdout, /github\.com\/jnsys\/dsh-rpc/);
+});

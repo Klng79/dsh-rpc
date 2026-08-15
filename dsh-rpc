@@ -12,6 +12,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const BASE = process.env.DSH_URL || 'http://127.0.0.1:3080';
+const BUILD_ID = 'jnsys-guarded-1';
+const SOURCE_URL = 'https://github.com/jnsys/dsh-rpc';
 const DEFAULT_POLL_MS = positiveNumber(process.env.DSH_POLL_MS || 1000, 'DSH_POLL_MS');
 const SAFE_PERMISSIONS = new Set(['read-only', 'workspace-write']);
 const ALL_PERMISSIONS = new Set([...SAFE_PERMISSIONS, 'danger-full-access']);
@@ -365,6 +367,8 @@ Safety properties:
   - danger-full-access needs both --permission danger-full-access and
     --allow-danger-full-access`;
 
+const VERSION = `dsh-rpc ${BUILD_ID}\nsource: ${SOURCE_URL}`;
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   switch (command) {
@@ -374,6 +378,7 @@ async function main() {
     case 'history': return cmdHistory(args);
     case 'workspaces': return cmdWorkspaces();
     case 'sessions': return cmdSessions();
+    case 'version': case '--version': case '-V': console.log(VERSION); return;
     case 'help': case '--help': case '-h': case undefined: console.log(HELP); return;
     default: throw new Error(`unknown command: ${command}`);
   }
