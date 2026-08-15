@@ -2,306 +2,393 @@
 'use strict';
 
 /*
- * dsh-rpc — drive the DeepSeek Harness (dsh) web-server /api RPC endpoint from the CLI.
+ * dsh-rpc — safety-first CLI automation for DeepSeek Harness grouped sessions.
  *
- * dsh's web UI is a React client over a local HTTP RPC bridge (`/api`) plus two
- * WebSocket downlinks. This tool talks to the same `/api` bridge directly, so
- * sessions it creates are GROUPED under a workspace exactly like ones created in
- * the web UI (unlike `dsh --profile headless`, which is always ungrouped).
- *
- * Transport (reverse-engineered from @deepseek-ai/dsh v0.1.0-rc.6):
- *   POST <BASE>/api/<method>
- *   Content-Type: application/json
- *   body: { "type":"client-request", "rpcId":<uuid>, "method":<method>, "payload":{...} }
- *   resp: { "type":"server-response", "rpcId":<uuid>,
- *           "result": { "ok":true, "value":... } | { "ok":false, "error":{code,message} } }
- *
- * The server enforces a browser-trust fence: the request Host must be a loopback
- * authority (127.0.0.1 / localhost) or a declared --trusted-host. Running locally,
- * plain fetch to 127.0.0.1 passes automatically. No auth layer exists (loopback only).
- *
- * Environment:
- *   DSH_URL       server base url        (default http://127.0.0.1:3080)
- *   DSH_POLL_MS   completion poll period (default 1000)
- *
- * This file is intentionally dependency-free and module-system agnostic
- * (no require/import, no top-level await) so it runs under either CJS or ESM.
+ * The guarded run path verifies the exact registered workspace and permission,
+ * monitors approvals and terminal events, and fails closed on ambiguity.
  */
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 const BASE = process.env.DSH_URL || 'http://127.0.0.1:3080';
-const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
+const DEFAULT_POLL_MS = positiveNumber(process.env.DSH_POLL_MS || 1000, 'DSH_POLL_MS');
+const SAFE_PERMISSIONS = new Set(['read-only', 'workspace-write']);
+const ALL_PERMISSIONS = new Set([...SAFE_PERMISSIONS, 'danger-full-access']);
+
+function positiveNumber(value, name) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${name} must be a positive number`);
+  return parsed;
+}
 
 function uuid() {
-  const c = globalThis.crypto;
-  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-  return 'rpc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `rpc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function rpc(method, payload) {
+async function rpc(method, payload = {}) {
   const rpcId = uuid();
-  let res;
+  let response;
   try {
-    res = await fetch(`${BASE}/api/${method}`, {
+    response = await fetch(`${BASE}/api/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId, method, payload: payload || {} }),
+      body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
     });
-  } catch (e) {
-    throw new Error(`cannot reach dsh at ${BASE} — is the web UI running? (${e.message})`);
+  } catch (error) {
+    throw new Error(`cannot reach dsh at ${BASE} — is the web server running? (${error.message})`);
   }
-  if (!res.ok) {
-    const text = (await res.text().catch(() => '')).slice(0, 200);
-    throw new Error(`transport failure ${res.status} for ${method}${text ? ': ' + text : ''}`);
+  if (!response.ok) {
+    const body = (await response.text().catch(() => '')).slice(0, 300);
+    throw new Error(`transport failure ${response.status} for ${method}${body ? `: ${body}` : ''}`);
   }
-  const full = await res.json();
-  if (!full || !full.result) throw new Error(`malformed response for ${method}`);
-  if (!full.result.ok) {
-    const err = full.result.error || {};
-    throw new Error(`${method} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`);
+  const envelope = await response.json();
+  if (envelope?.type !== 'server-response' || envelope.rpcId !== rpcId || !envelope.result) {
+    throw new Error(`malformed or mismatched response for ${method}`);
   }
-  return full.result.value;
+  if (!envelope.result.ok) {
+    const error = envelope.result.error || {};
+    throw new Error(`${method} failed: ${error.code || 'unknown'}${error.message ? `: ${error.message}` : ''}`);
+  }
+  return envelope.result.value;
 }
 
-/* ---- helpers ---- */
-
-function resolvePath(p) {
-  if (!p) return process.cwd();
-  if (p === '~') return process.env.HOME;
-  if (p.indexOf('~/') === 0) return process.env.HOME + p.slice(1);
-  if (p.indexOf('/') === 0) return p;
-  return process.cwd() + '/' + p;
+function eventOf(entry) {
+  return entry?.event || entry;
 }
 
 function textOf(message) {
-  const parts = [];
-  for (const block of (message && message.content) || []) {
-    if (block && block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
-  }
-  return parts.join('\n');
-}
-
-async function listWorkspaces() {
-  return (await rpc('workspace.list', {})).items || [];
-}
-
-async function findWorkspaceByPath(absPath) {
-  const items = await listWorkspaces();
-  return items.find((w) => w.path === absPath);
-}
-
-async function ensureWorkspace(absPath) {
-  const existing = await findWorkspaceByPath(absPath);
-  if (existing) return existing;
-  const created = await rpc('workspace.create', { path: absPath });
-  return created.workspace;
-}
-
-async function getHistory(sessionId) {
-  return rpc('session.history', { sessionId, maxMessages: 200 });
+  return (message?.content || [])
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n');
 }
 
 function finalAssistantText(history) {
-  const events = (history && history.events) || [];
-  // walk newest-to-oldest; return the last assistant message that has visible text
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i].event || events[i];
-    if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
-      const text = textOf(ev.data.message);
-      if (text.trim() !== '') return text;
+  const events = history?.events || [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = eventOf(events[index]);
+    if (event?.type === 'assistant/message' && event.data?.message) {
+      const text = textOf(event.data.message);
+      if (text.trim()) return text;
     }
   }
   return '';
 }
 
-async function waitForCompletion(sessionId, timeoutMs, quiet) {
-  const deadline = Date.now() + timeoutMs;
-  const start = Date.now();
-  let sawRunning = false;
-  while (Date.now() < deadline) {
-    let summary;
-    try {
-      const list = await rpc('session.list', {});
-      summary = (list.items || []).find((i) => i.sessionId === sessionId);
-    } catch (e) {
-      /* transient server hiccup — keep polling */
+function currentPermission(history) {
+  const projected = history?.projections?.values?.permissions?.currentValue;
+  if (typeof projected === 'string') return projected;
+  const events = history?.events || [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = eventOf(events[index]);
+    if (event?.type === 'permission/preset' && typeof event.data?.preset === 'string') {
+      return event.data.preset;
     }
-    if (summary && summary.running) sawRunning = true;
-    const graceDone = sawRunning || (Date.now() - start > 3000);
-    if (summary && summary.running === false && graceDone) return;
-    if (!quiet) {
-      const secs = Math.round((Date.now() - start) / 1000);
-      process.stderr.write(`\r  dsh working… ${secs}s${summary && summary.running ? ' (running)' : ''}   `);
-    }
-    await sleep(POLL_MS);
   }
-  throw new Error(`timed out after ${timeoutMs}ms waiting for session ${sessionId}`);
+  return undefined;
 }
 
-/* ---- commands ---- */
+function latestTurnEnd(history) {
+  const events = history?.events || [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = eventOf(events[index]);
+    if (event?.type === 'turn/end') return event;
+  }
+  return undefined;
+}
+
+function pendingApproval(history) {
+  const pending = new Map();
+  for (const entry of history?.events || []) {
+    const event = eventOf(entry);
+    if (event?.type === 'approval/asked' && event.data?.id) pending.set(event.data.id, event.data);
+    if (event?.type === 'approval/decided' && event.data?.id) pending.delete(event.data.id);
+  }
+  return pending.values().next().value;
+}
+
+function markerOutcome(text, jobId) {
+  if (!jobId) return undefined;
+  const escaped = jobId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = text.match(new RegExp(`(?:^|\\n)DEEPSEEK_(DONE|BLOCKED|NEEDS_INPUT):${escaped}\\s*$`));
+  return match?.[1];
+}
+
+async function historyFor(sessionId) {
+  return rpc('session.history', { sessionId, maxMessages: 200 });
+}
+
+async function sessionSummary(sessionId) {
+  const list = await rpc('session.list', {});
+  return (list.items || []).find(item => item.sessionId === sessionId);
+}
+
+async function cancelSession(sessionId) {
+  return rpc('session.cancel', { sessionId });
+}
+
+function parseRunArgs(args) {
+  const options = {
+    workspacePath: process.cwd(),
+    permission: 'read-only',
+    timeoutMs: 10 * 60 * 1000,
+    pollMs: DEFAULT_POLL_MS,
+    wait: true,
+    quiet: false,
+    json: false,
+    allowDangerFullAccess: false,
+  };
+  const taskParts = [];
+  let literal = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (literal) { taskParts.push(arg); continue; }
+    if (arg === '--') { literal = true; continue; }
+    if (arg === '--workspace' || arg === '-w') options.workspacePath = requiredValue(args, ++index, arg);
+    else if (arg === '--require-title') options.requireTitle = requiredValue(args, ++index, arg);
+    else if (arg === '--permission' || arg === '-p') options.permission = requiredValue(args, ++index, arg);
+    else if (arg === '--job-id') options.jobId = requiredValue(args, ++index, arg);
+    else if (arg === '--task-file') options.taskFile = requiredValue(args, ++index, arg);
+    else if (arg === '--timeout') options.timeoutMs = positiveNumber(requiredValue(args, ++index, arg), arg) * 1000;
+    else if (arg === '--poll-ms') options.pollMs = positiveNumber(requiredValue(args, ++index, arg), arg);
+    else if (arg === '--no-wait') options.wait = false;
+    else if (arg === '--quiet' || arg === '-q') options.quiet = true;
+    else if (arg === '--json') options.json = true;
+    else if (arg === '--allow-danger-full-access') options.allowDangerFullAccess = true;
+    else if (arg.startsWith('-')) throw new Error(`unknown option: ${arg}`);
+    else taskParts.push(arg);
+  }
+  if (!ALL_PERMISSIONS.has(options.permission)) {
+    throw new Error(`unknown permission ${JSON.stringify(options.permission)}; expected read-only, workspace-write, or danger-full-access`);
+  }
+  if (options.permission === 'danger-full-access' && !options.allowDangerFullAccess) {
+    throw new Error('danger-full-access requires the explicit --allow-danger-full-access acknowledgement');
+  }
+  if (options.taskFile && taskParts.length) throw new Error('use either task text or --task-file, not both');
+  const task = options.taskFile ? fs.readFileSync(options.taskFile, 'utf8').trim() : taskParts.join(' ').trim();
+  if (!task) throw new Error('run requires non-empty task text or --task-file');
+  options.task = task;
+  options.workspacePath = path.resolve(options.workspacePath);
+  return options;
+}
+
+function requiredValue(args, index, option) {
+  const value = args[index];
+  if (!value || value.startsWith('--')) throw new Error(`${option} requires a value`);
+  return value;
+}
+
+async function requireWorkspace(workspacePath, requireTitle) {
+  const list = await rpc('workspace.list', {});
+  const workspace = (list.items || []).find(item => path.resolve(item.path) === workspacePath);
+  if (!workspace) throw new Error(`required workspace is not registered: ${workspacePath}`);
+  if (requireTitle && workspace.title !== requireTitle) {
+    throw new Error(`workspace title mismatch: expected ${JSON.stringify(requireTitle)}, got ${JSON.stringify(workspace.title)}`);
+  }
+  return workspace;
+}
+
+async function applyAndVerifyPermission(sessionId, permission) {
+  const execution = await rpc('commands/execute', {
+    args: {
+      agentId: sessionId,
+      line: `/permission ${permission}`,
+    },
+  });
+  if (execution?.result?.kind !== 'success') {
+    const detail = execution?.result?.text ? `: ${execution.result.text}` : '';
+    throw new Error(`Harness did not accept the /permission command for ${sessionId}${detail}`);
+  }
+  const history = await historyFor(sessionId);
+  const actual = currentPermission(history);
+  if (actual !== permission) {
+    throw new Error(`permission verification failed for ${sessionId}: expected ${permission}, got ${actual || 'unknown'}`);
+  }
+}
+
+async function waitForCompletion(sessionId, options) {
+  const deadline = Date.now() + options.timeoutMs;
+  const startedAt = Date.now();
+  let lastHistory;
+  while (Date.now() < deadline) {
+    const summary = await sessionSummary(sessionId);
+    if (!summary) throw new Error(`session disappeared while monitoring: ${sessionId}`);
+    lastHistory = await historyFor(sessionId);
+    const approval = pendingApproval(lastHistory);
+    if (approval) {
+      await cancelSession(sessionId).catch(() => {});
+      throw new Error(`session requested approval for ${approval.toolName || 'an operation'}; cancelled`);
+    }
+    const turnEnd = latestTurnEnd(lastHistory);
+    if (!summary.running && turnEnd) {
+      const assistantText = finalAssistantText(lastHistory);
+      const outcome = markerOutcome(assistantText, options.jobId);
+      const permission = currentPermission(lastHistory);
+      if (turnEnd.data?.reason?.kind !== 'completed') {
+        throw new Error(`session ended with ${turnEnd.data?.reason?.kind || 'an unknown reason'}`);
+      }
+      if (permission !== options.permission) {
+        throw new Error(`permission changed while running: expected ${options.permission}, got ${permission || 'unknown'}`);
+      }
+      if (options.jobId && !outcome) {
+        throw new Error(`protocol failure: final assistant response lacks a matching marker for ${options.jobId}`);
+      }
+      return {
+        sessionId,
+        running: false,
+        elapsedMs: Date.now() - startedAt,
+        permission,
+        turnEndReason: turnEnd.data.reason.kind,
+        outcome,
+        assistantText,
+      };
+    }
+    if (!options.quiet) {
+      const seconds = Math.round((Date.now() - startedAt) / 1000);
+      process.stderr.write(`\r  dsh working… ${seconds}s${summary.running ? ' (running)' : ' (queued)'}   `);
+    }
+    await sleep(options.pollMs);
+  }
+  await cancelSession(sessionId).catch(() => {});
+  throw new Error(`timed out after ${options.timeoutMs}ms; cancelled session ${sessionId}`);
+}
+
+async function cmdRun(args) {
+  const options = parseRunArgs(args);
+  const workspace = await requireWorkspace(options.workspacePath, options.requireTitle);
+  const created = await rpc('session.create', { workspaceId: workspace.workspaceId });
+  const sessionId = created.sessionId;
+  try {
+    await applyAndVerifyPermission(sessionId, options.permission);
+    if (!options.quiet) {
+      console.error(`session ${sessionId} in ${workspace.title}; verified permission ${options.permission}`);
+    }
+    const accepted = await rpc('session.prompt', {
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: options.task }],
+    });
+    if (accepted?.accepted !== true) throw new Error(`Harness did not accept the task for ${sessionId}`);
+    if (!options.wait) {
+      const result = { sessionId, workspace: workspace.title, permission: options.permission, accepted: true };
+      console.log(options.json ? JSON.stringify(result, null, 2) : sessionId);
+      return;
+    }
+    const result = await waitForCompletion(sessionId, options);
+    if (!options.quiet) process.stderr.write('\n');
+    console.log(options.json ? JSON.stringify({ ...result, workspace: workspace.title }, null, 2) : result.assistantText);
+    if (result.outcome === 'BLOCKED') process.exitCode = 3;
+    if (result.outcome === 'NEEDS_INPUT') process.exitCode = 4;
+  } catch (error) {
+    await cancelSession(sessionId).catch(() => {});
+    throw error;
+  }
+}
+
+async function cmdStatus(args) {
+  const sessionId = args[0];
+  if (!sessionId) throw new Error('status requires a session id');
+  let jobId;
+  for (let index = 1; index < args.length; index += 1) {
+    if (args[index] === '--job-id') jobId = requiredValue(args, ++index, '--job-id');
+    else throw new Error(`unknown status option: ${args[index]}`);
+  }
+  const [summary, history] = await Promise.all([sessionSummary(sessionId), historyFor(sessionId)]);
+  if (!summary) throw new Error(`unknown session: ${sessionId}`);
+  const turnEnd = latestTurnEnd(history);
+  const assistantText = finalAssistantText(history);
+  console.log(JSON.stringify({
+    sessionId,
+    running: summary.running,
+    permission: currentPermission(history),
+    pendingApproval: pendingApproval(history) || null,
+    turnEndReason: turnEnd?.data?.reason?.kind || null,
+    outcome: markerOutcome(assistantText, jobId) || null,
+    assistantText,
+  }, null, 2));
+}
 
 async function cmdWorkspaces() {
-  const items = await listWorkspaces();
-  if (!items.length) { console.log('(no workspaces)'); return; }
-  for (const w of items) {
-    console.log(`${w.workspaceId}  ${w.title}  [${w.sessionIds.length} sessions]  ${w.path}`);
-  }
+  const list = await rpc('workspace.list', {});
+  console.log(JSON.stringify(list.items || [], null, 2));
 }
 
 async function cmdSessions() {
   const list = await rpc('session.list', {});
-  const items = list.items || [];
-  if (!items.length) { console.log('(no sessions)'); return; }
-  for (const s of items) {
-    const flags = [s.running ? 'running' : 'idle', s.blank ? 'blank' : 'has-history'].join(',');
-    console.log(`${s.sessionId}  (${flags})  ${s.cwd || ''}`);
-  }
-}
-
-async function cmdRun(args) {
-  // parse flags
-  let workspacePath = null;
-  let wait = true;
-  let quiet = false;
-  let timeoutMs = 10 * 60 * 1000;
-  const taskParts = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--workspace' || a === '-w') { workspacePath = args[++i]; }
-    else if (a === '--no-wait') { wait = false; }
-    else if (a === '--quiet' || a === '-q') { quiet = true; }
-    else if (a === '--timeout') { timeoutMs = Number(args[++i]) * 1000; }
-    else { taskParts.push(a); }
-  }
-  const task = taskParts.join(' ').trim();
-  if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--no-wait] [--timeout <sec>]');
-
-  const absPath = resolvePath(workspacePath);
-  const workspace = await ensureWorkspace(absPath);
-
-  const created = await rpc('session.create', { workspaceId: workspace.workspaceId });
-  const sessionId = created.sessionId;
-  if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
-
-  await rpc('session.prompt', {
-    sessionId,
-    mode: 'queue',
-    content: [{ type: 'text', text: task }],
-  });
-
-  if (!wait) {
-    console.log(sessionId);
-    return;
-  }
-
-  await waitForCompletion(sessionId, timeoutMs, quiet);
-  if (!quiet) process.stderr.write('\n');
-  const history = await getHistory(sessionId);
-  const text = finalAssistantText(history);
-  console.log(text || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
-  console.error(`\n[done] session ${sessionId}`);
-}
-
-async function cmdPrompt(args) {
-  let wait = false;
-  let quiet = false;
-  let timeoutMs = 10 * 60 * 1000;
-  const rest = [];
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--wait') { wait = true; }
-    else if (a === '--quiet' || a === '-q') { quiet = true; }
-    else if (a === '--timeout') { timeoutMs = Number(args[++i]) * 1000; }
-    else { rest.push(a); }
-  }
-  const sessionId = rest[0];
-  const text = rest.slice(1).join(' ').trim();
-  if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--timeout <sec>] [--quiet] <text…>');
-  await rpc('session.prompt', {
-    sessionId,
-    mode: 'queue',
-    content: [{ type: 'text', text }],
-  });
-  if (!wait) {
-    console.log(`accepted session ${sessionId}`);
-    return;
-  }
-  await waitForCompletion(sessionId, timeoutMs, quiet);
-  if (!quiet) process.stderr.write('\n');
-  const history = await getHistory(sessionId);
-  console.log(finalAssistantText(history) || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
-  console.error(`\n[done] session ${sessionId}`);
+  console.log(JSON.stringify(list.items || [], null, 2));
 }
 
 async function cmdHistory(args) {
   const sessionId = args[0];
-  if (!sessionId) throw new Error('usage: dsh-rpc history <sessionId>');
-  const history = await getHistory(sessionId);
-  for (const entry of history.events || []) {
-    const ev = entry.event || entry;
-    if (ev.type === 'user/message' && ev.data && ev.data.message) {
-      console.log(`\n=== user ===\n${textOf(ev.data.message)}`);
-    } else if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
-      const text = textOf(ev.data.message);
-      if (text.trim() !== '') console.log(`\n=== assistant ===\n${text}`);
-    } else if (ev.type === 'tool/result' && ev.data && ev.data.message) {
-      console.log(`\n=== tool-result ===\n${textOf(ev.data.message).slice(0, 400)}`);
-    }
-  }
+  if (!sessionId) throw new Error('history requires a session id');
+  console.log(JSON.stringify(await historyFor(sessionId), null, 2));
 }
 
-async function cmdCall(args) {
-  const method = args[0];
-  const payloadJson = args.slice(1).join(' ');
-  if (!method) throw new Error('usage: dsh-rpc call <method> [json-payload]');
-  let payload = {};
-  if (payloadJson) {
-    try { payload = JSON.parse(payloadJson); }
-    catch (e) { throw new Error('payload must be valid JSON: ' + e.message); }
-  }
-  const value = await rpc(method, payload);
-  console.log(JSON.stringify(value, null, 2));
+async function cmdCancel(args) {
+  const sessionId = args[0];
+  if (!sessionId) throw new Error('cancel requires a session id');
+  const result = await cancelSession(sessionId);
+  console.log(JSON.stringify({ sessionId, cancelled: result?.accepted === true }, null, 2));
 }
 
-const HELP = `dsh-rpc — drive DeepSeek Harness (dsh) via its local /api RPC endpoint.
+const HELP = `dsh-rpc — guarded CLI for DeepSeek Harness grouped sessions.
 
 Usage:
-  dsh-rpc workspaces                       list workspaces
-  dsh-rpc sessions                         list sessions
-  dsh-rpc run <task…> [opts]               create a grouped session, send task, wait, print result
-       --workspace,-w <path>               target workspace dir (default: cwd)
-       --no-wait                           return the session id immediately
-       --timeout <sec>                     max wait (default 600)
-       --quiet,-q                          suppress progress
-  dsh-rpc prompt <sessionId> <text…>       send a prompt to an existing session
-  dsh-rpc history <sessionId>              print a session's messages
-  dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session.list '{}')
+  dsh-rpc run [task text] [options]
+    --workspace,-w <path>       require this registered workspace (default: cwd)
+    --require-title <title>     require the workspace title too
+    --permission,-p <mode>      read-only (default) or workspace-write
+    --job-id <id>               require a matching DEEPSEEK_* terminal marker
+    --task-file <path>          read task text from a file
+    --timeout <seconds>         cancel after this deadline (default: 600)
+    --poll-ms <milliseconds>    polling interval (default: DSH_POLL_MS or 1000)
+    --no-wait                   return after task admission
+    --json                      print structured output
+    --quiet,-q                  suppress progress
 
-Env: DSH_URL (default http://127.0.0.1:3080), DSH_POLL_MS (default 1000)
+  dsh-rpc status <session-id> [--job-id <id>]
+  dsh-rpc cancel <session-id>
+  dsh-rpc history <session-id>
+  dsh-rpc workspaces
+  dsh-rpc sessions
 
-Grouped-session guarantee: sessions are created through the same /api path the
-web UI uses, so they appear under their workspace (not as "ungrouped").`;
+Safety properties:
+  - never creates a missing workspace
+  - applies and verifies permission before task submission
+  - defaults to read-only
+  - cancels on timeout or an unresolved approval request
+  - validates turn/end and the optional job marker
+  - danger-full-access needs both --permission danger-full-access and
+    --allow-danger-full-access`;
 
 async function main() {
-  const [cmd, ...rest] = process.argv.slice(2);
-  switch (cmd) {
+  const [command, ...args] = process.argv.slice(2);
+  switch (command) {
+    case 'run': return cmdRun(args);
+    case 'status': return cmdStatus(args);
+    case 'cancel': return cmdCancel(args);
+    case 'history': return cmdHistory(args);
     case 'workspaces': return cmdWorkspaces();
     case 'sessions': return cmdSessions();
-    case 'run': return cmdRun(rest);
-    case 'prompt': return cmdPrompt(rest);
-    case 'history': return cmdHistory(rest);
-    case 'call': return cmdCall(rest);
-    case 'help': case '--help': case '-h': case undefined:
-      console.log(HELP); return;
-    default:
-      console.error(`unknown command: ${cmd}\n`);
-      console.log(HELP);
-      process.exitCode = 2;
+    case 'help': case '--help': case '-h': case undefined: console.log(HELP); return;
+    default: throw new Error(`unknown command: ${command}`);
   }
 }
 
-main().catch((err) => {
-  console.error(`dsh-rpc error: ${err.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(error => {
+    console.error(`dsh-rpc error: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  currentPermission,
+  finalAssistantText,
+  markerOutcome,
+  pendingApproval,
+};
