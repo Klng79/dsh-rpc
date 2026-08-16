@@ -34,9 +34,8 @@
  * (no require/import, no top-level await) so it runs under either CJS or ESM.
  */
 
-const BASE = process.env.DSH_URL || 'http://127.0.0.1:3080';
+const BASE = (process.env.DSH_URL || 'http://127.0.0.1:3080').replace(/\/+$/, '');
 const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
-const KNOWN_PERMISSIONS = ['read-only', 'workspace-write', 'danger-full-access'];
 
 function uuid() {
   const c = globalThis.crypto;
@@ -45,6 +44,20 @@ function uuid() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// While a session is being waited on, SIGINT (Ctrl-C) cancels it instead of
+// leaving it running unattended — matching the tool's cancel-on-approval /
+// cancel-on-timeout safety behavior. cancelSession is declared below; the
+// handler only runs after module load, so hoisting covers it.
+let activeSession = null;
+
+process.on('SIGINT', () => {
+  const id = activeSession;
+  activeSession = null;
+  process.stderr.write('\ninterrupted — cancelling session' + (id ? ' ' + id : '') + '\n');
+  if (id) cancelSession(id).catch(() => {});
+  process.exit(130);
+});
 
 async function rpc(method, payload) {
   const rpcId = uuid();
@@ -79,6 +92,24 @@ function resolvePath(p) {
   if (p.indexOf('~/') === 0) return process.env.HOME + p.slice(1);
   if (p.indexOf('/') === 0) return p;
   return process.cwd() + '/' + p;
+}
+
+// Return the value that follows a --flag at args[flagIndex], or throw a clear
+// error if the flag is the last argument or the next token looks like a flag.
+function nextValue(args, flagIndex, flag) {
+  const v = args[flagIndex + 1];
+  if (v === undefined || (v.length > 0 && v[0] === '-' && v !== '-')) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return v;
+}
+
+function parseTimeoutSeconds(v, flag) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${flag} must be a positive number of seconds`);
+  }
+  return n * 1000;
 }
 
 function textOf(message) {
@@ -159,7 +190,33 @@ function cancelSession(sessionId) {
   return rpc('session.cancel', { sessionId });
 }
 
+// Extract the preset names a deployment actually offers, from the session's
+// `permissions` projection (projections.values.permissions.options). Tolerates
+// options being an array of strings or of objects ({name|value|id|key}).
+function permissionPresetNames(history) {
+  const proj = history && history.projections && history.projections.values && history.projections.values.permissions;
+  const options = proj && proj.options;
+  if (!Array.isArray(options)) return [];
+  const names = [];
+  for (const o of options) {
+    if (typeof o === 'string') { if (o) names.push(o); }
+    else if (o && typeof o === 'object') {
+      const n = o.name || o.value || o.id || o.key;
+      if (typeof n === 'string' && n) names.push(n);
+    }
+  }
+  return names;
+}
+
 async function applyAndVerifyPermission(sessionId, permission) {
+  // Deployment-level check: only accept presets this deployment actually offers.
+  // If the projection exposes no options we skip the pre-check and rely on the
+  // verify step below (a wrong preset still fails verification).
+  const history = await getHistory(sessionId);
+  const names = permissionPresetNames(history);
+  if (names.length && !names.includes(permission)) {
+    throw new Error(`permission "${permission}" is not offered by this deployment; available: ${names.join(', ')}`);
+  }
   const exec = await rpc('commands/execute', {
     args: { agentId: sessionId, line: `/permission ${permission}` },
   });
@@ -167,8 +224,8 @@ async function applyAndVerifyPermission(sessionId, permission) {
     const detail = exec && exec.result && exec.result.text ? `: ${exec.result.text}` : '';
     throw new Error(`could not set permission "${permission}" for ${sessionId}${detail}`);
   }
-  const history = await getHistory(sessionId);
-  const actual = currentPermission(history);
+  const verified = await getHistory(sessionId);
+  const actual = currentPermission(verified);
   if (actual && actual !== permission) {
     throw new Error(`permission verification failed for ${sessionId}: expected ${permission}, got ${actual}`);
   }
@@ -216,6 +273,37 @@ async function waitForCompletion(sessionId, timeoutMs, quiet) {
   throw new Error(`timed out after ${timeoutMs}ms; cancelled session ${sessionId}`);
 }
 
+// Shared core for `run` and `prompt --wait`: set+verify the permission (if
+// requested), enqueue the prompt, then either print the session id immediately
+// (`onIdle`) or wait for completion and print the final assistant text.
+// Whether to cancel the session on error is left to the caller: `run` cancels
+// its freshly-created session, `prompt` does not (that session may pre-exist).
+async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs, onIdle }) {
+  activeSession = sessionId;
+  try {
+    if (permission) {
+      await applyAndVerifyPermission(sessionId, permission);
+      if (!quiet) console.error(`verified permission ${permission}`);
+    }
+    await rpc('session.prompt', {
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: task }],
+    });
+    if (!wait) {
+      onIdle();
+      return;
+    }
+    await waitForCompletion(sessionId, timeoutMs, quiet);
+    if (!quiet) process.stderr.write('\n');
+    const history = await getHistory(sessionId);
+    console.log(finalAssistantText(history) || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
+    console.error(`\n[done] session ${sessionId}`);
+  } finally {
+    activeSession = null;
+  }
+}
+
 /* ---- commands ---- */
 
 async function cmdWorkspaces() {
@@ -247,17 +335,17 @@ async function cmdRun(args) {
   const taskParts = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--workspace' || a === '-w') { workspacePath = args[++i]; }
-    else if (a === '--permission' || a === '-p') { permission = args[++i]; }
+    if (a === '--workspace' || a === '-w') { workspacePath = nextValue(args, i, '--workspace'); i++; }
+    else if (a === '--permission' || a === '-p') { permission = nextValue(args, i, '--permission'); i++; }
     else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--no-wait') { wait = false; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
-    else if (a === '--timeout') { timeoutMs = Number(args[++i]) * 1000; }
+    else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
     else { taskParts.push(a); }
   }
   const task = taskParts.join(' ').trim();
   if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--permission <mode>] [--no-wait] [--timeout <sec>]');
-  if (permission) validatePermission(permission, allowDangerFullAccess);
+  if (permission) checkPermissionAck(permission, allowDangerFullAccess);
 
   const absPath = resolvePath(workspacePath);
   const workspace = await ensureWorkspace(absPath);
@@ -267,26 +355,9 @@ async function cmdRun(args) {
   if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
 
   try {
-    if (permission) {
-      await applyAndVerifyPermission(sessionId, permission);
-      if (!quiet) console.error(`verified permission ${permission}`);
-    }
-    await rpc('session.prompt', {
-      sessionId,
-      mode: 'queue',
-      content: [{ type: 'text', text: task }],
-    });
-    if (!wait) {
-      console.log(sessionId);
-      return;
-    }
-    await waitForCompletion(sessionId, timeoutMs, quiet);
-    if (!quiet) process.stderr.write('\n');
-    const history = await getHistory(sessionId);
-    const text = finalAssistantText(history);
-    console.log(text || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
-    console.error(`\n[done] session ${sessionId}`);
+    await runSession({ sessionId, task, wait, quiet, permission, timeoutMs, onIdle: () => console.log(sessionId) });
   } catch (e) {
+    // this is a fresh session we created — cancel it so a failed run doesn't leave it running
     await cancelSession(sessionId).catch(() => {});
     throw e;
   }
@@ -302,37 +373,26 @@ async function cmdPrompt(args) {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--wait') { wait = true; }
-    else if (a === '--permission' || a === '-p') { permission = args[++i]; }
+    else if (a === '--permission' || a === '-p') { permission = nextValue(args, i, '--permission'); i++; }
     else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
-    else if (a === '--timeout') { timeoutMs = Number(args[++i]) * 1000; }
+    else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
     else { rest.push(a); }
   }
   const sessionId = rest[0];
   const text = rest.slice(1).join(' ').trim();
   if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--permission <mode>] [--timeout <sec>] [--quiet] <text…>');
-  if (permission) validatePermission(permission, allowDangerFullAccess);
-  if (permission) await applyAndVerifyPermission(sessionId, permission);
-  await rpc('session.prompt', {
-    sessionId,
-    mode: 'queue',
-    content: [{ type: 'text', text }],
-  });
-  if (!wait) {
-    console.log(`accepted session ${sessionId}`);
-    return;
-  }
-  await waitForCompletion(sessionId, timeoutMs, quiet);
-  if (!quiet) process.stderr.write('\n');
-  const history = await getHistory(sessionId);
-  console.log(finalAssistantText(history) || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
-  console.error(`\n[done] session ${sessionId}`);
+  if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  // runSession does NOT cancel this session on error — it may pre-exist and
+  // belong to prior work, unlike the fresh session created by `run`.
+  await runSession({ sessionId, task: text, wait, quiet, permission, timeoutMs, onIdle: () => console.log(`accepted session ${sessionId}`) });
 }
 
-function validatePermission(permission, allowDangerFullAccess) {
-  if (!KNOWN_PERMISSIONS.includes(permission)) {
-    throw new Error(`unknown permission "${permission}"; expected one of: ${KNOWN_PERMISSIONS.join(', ')}`);
-  }
+// CLI-level acknowledgement guard (no server call): the full-access preset is
+// only reachable when the user passes --allow-danger-full-access. Whether the
+// deployment actually offers the requested preset is validated against its
+// `permissions` projection inside applyAndVerifyPermission.
+function checkPermissionAck(permission, allowDangerFullAccess) {
   if (permission === 'danger-full-access' && !allowDangerFullAccess) {
     throw new Error('permission danger-full-access requires the explicit --allow-danger-full-access acknowledgement');
   }
@@ -375,8 +435,8 @@ Usage:
   dsh-rpc sessions                         list sessions
   dsh-rpc run <task…> [opts]               create a grouped session, send task, wait, print result
        --workspace,-w <path>               target workspace dir (default: cwd)
-       --permission,-p <mode>              set+verify session permission before the task:
-                                           read-only | workspace-write | danger-full-access
+       --permission,-p <mode>              set+verify session permission before the task
+                                           (preset must be offered by the deployment; e.g. read-only)
        --allow-danger-full-access          required acknowledgement for danger-full-access
        --no-wait                           return the session id immediately
        --timeout <sec>                     max wait, then cancel (default 600)
@@ -393,8 +453,8 @@ web UI uses, so they appear under their workspace (not as "ungrouped").
 
 Safety behavior: with --permission the preset is applied via commands/execute and
 verified before the task is submitted; completion requires a turn/end with reason
-"completed"; a pending approval or a timeout cancels the session instead of
-leaving it running.`;
+"completed"; a pending approval, a timeout, or Ctrl-C cancels the session instead
+of leaving it running.`;
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);

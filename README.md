@@ -45,6 +45,13 @@ Copy the script anywhere on your `PATH`:
 install -m 0755 dsh-rpc ~/.local/bin/dsh-rpc
 ```
 
+Or link it via the bundled `package.json` (also what enables the test suite):
+
+```sh
+npm link          # adds a `dsh-rpc` bin on your PATH
+npm test          # runs the dependency-free node:test suite against a mock server
+```
+
 ## Usage
 
 ```
@@ -117,6 +124,9 @@ Notes:
 - dsh assigns its **own default preset to new sessions** (on the deployment this
   was built against, the default is `danger-full-access`). Pass `--permission`
   to override it for a run.
+- The requested preset is **validated against the deployment's**
+  `permissions.options` before it is applied, so a preset the deployment doesn't
+  define is rejected up front (instead of relying on a hardcoded list).
 - The chosen preset is applied via `commands/execute` and **verified** against
   the session's `permissions` projection before the task is submitted; a
   mismatch aborts the run.
@@ -128,7 +138,17 @@ Notes:
 
 - The final answer (or session id with `--no-wait`) goes to **stdout**;
   progress and diagnostics go to **stderr**.
-- Exit code `0` on success, `1` on error, `2` on an unknown command.
+- Exit code `0` on success, `1` on error, `2` on an unknown command,
+  `130` when interrupted with Ctrl-C (which cancels the active session).
+
+## Testing
+
+`npm test` runs a dependency-free `node:test` suite (`test/dsh-rpc.test.js`)
+that spawns the CLI against an in-process mock of the `/api` bridge — no real
+dsh server needed. It covers the RPC envelope, trailing-slash `DSH_URL`,
+`--timeout`/missing-value validation, completion detection, the approval →
+cancel path, the non-completed terminal-reason gate, deployment-aware
+`--permission` validation, and the shared `run`/`prompt` completion path.
 
 ## How it works
 
@@ -164,23 +184,27 @@ tool dependency-free — no WebSocket client required.
 These opt-in guards harden unattended runs. They are additive — the default
 `run`/`prompt` behavior is unchanged.
 
-- **Permission control** (`--permission`). The preset is applied through
-  `commands/execute` (`/permission <mode>`) and **verified** against the
-  session's `permissions` projection before the task is submitted.
-  `danger-full-access` additionally requires `--allow-danger-full-access`.
+- **Permission control** (`--permission`). The preset is checked against the
+  deployment's `permissions.options`, applied through `commands/execute`
+  (`/permission <mode>`) and **verified** against the session's `permissions`
+  projection before the task is submitted. `danger-full-access` additionally
+  requires `--allow-danger-full-access`.
 - **Stronger completion gate.** On finish, the latest `turn/end` event is
   checked; a terminal reason other than `completed` is surfaced as an error.
 - **Approval detection.** If the session raises an unresolved approval request
   while waiting, it is cancelled rather than left hanging.
 - **Cancel-on-timeout.** A timeout cancels the session instead of merely
   stopping the wait.
+- **Cancel on Ctrl-C.** Interrupting `run` or `prompt --wait` with Ctrl-C
+  cancels the active session before exiting (exit code 130).
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
 | `cannot reach dsh at http://127.0.0.1:3080` | The dsh web server isn't running. Start it with `npm exec @deepseek-ai/dsh web`, or point `DSH_URL` at the right address. |
-| `could not set permission "<mode>"` | The deployment doesn't define that preset. Presets are deployment config — inspect `projections.values.permissions.options` via `session.history`. |
+| `permission "<mode>" is not offered by this deployment` | The preset isn't in this deployment's `permissions.options`. List the real names with `dsh-rpc call session.history '{"sessionId":"<id>"}'` and read `projections.values.permissions.options`. |
+| `could not set permission "<mode>"` | The `/permission` command was rejected. Presets are deployment config — inspect `projections.values.permissions.options` via `session.history`. |
 | `permission verification failed` | The `/permission` command was accepted but the projection didn't reach the expected value. Re-run, or inspect `dsh-rpc history <id>`. |
 | `session ended with reason "<x>" (not completed)` | The turn did not finish cleanly (e.g. it was cancelled or errored). See `dsh-rpc history <id>`. |
 | `requested approval …; cancelled` | The session hit an approval prompt while unattended; the guard cancelled it. Re-run with a wider preset if the action is expected. |
