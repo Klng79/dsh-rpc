@@ -100,6 +100,36 @@ dsh-rpc call workspace.list '{}'
 | `DSH_URL` | `http://127.0.0.1:3080` | dsh web server base URL |
 | `DSH_POLL_MS` | `1000` | completion poll period (ms) |
 
+## Permission presets
+
+`--permission` selects a dsh permission preset (a bundle of sandbox mode +
+approval policy). The presets available depend on the deployment's configuration;
+a typical set:
+
+| Preset | What it allows |
+|--------|----------------|
+| `read-only` | Read the workspace; no writes or mutating commands |
+| `workspace-write` | Write inside the workspace and permitted temp dirs; wider actions require approval |
+| `danger-full-access` | Full file access without approval prompts — requires `--allow-danger-full-access` |
+
+Notes:
+
+- dsh assigns its **own default preset to new sessions** (on the deployment this
+  was built against, the default is `danger-full-access`). Pass `--permission`
+  to override it for a run.
+- The chosen preset is applied via `commands/execute` and **verified** against
+  the session's `permissions` projection before the task is submitted; a
+  mismatch aborts the run.
+- To see the presets a deployment actually offers:
+  `dsh-rpc call session.history '{"sessionId":"<id>"}'` and read
+  `projections.values.permissions.options`.
+
+## Output & exit codes
+
+- The final answer (or session id with `--no-wait`) goes to **stdout**;
+  progress and diagnostics go to **stderr**.
+- Exit code `0` on success, `1` on error, `2` on an unknown command.
+
 ## How it works
 
 dsh exposes a single RPC route. Each method is an HTTP POST to
@@ -144,6 +174,30 @@ These opt-in guards harden unattended runs. They are additive — the default
   while waiting, it is cancelled rather than left hanging.
 - **Cancel-on-timeout.** A timeout cancels the session instead of merely
   stopping the wait.
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| `cannot reach dsh at http://127.0.0.1:3080` | The dsh web server isn't running. Start it with `npm exec @deepseek-ai/dsh web`, or point `DSH_URL` at the right address. |
+| `could not set permission "<mode>"` | The deployment doesn't define that preset. Presets are deployment config — inspect `projections.values.permissions.options` via `session.history`. |
+| `permission verification failed` | The `/permission` command was accepted but the projection didn't reach the expected value. Re-run, or inspect `dsh-rpc history <id>`. |
+| `session ended with reason "<x>" (not completed)` | The turn did not finish cleanly (e.g. it was cancelled or errored). See `dsh-rpc history <id>`. |
+| `requested approval …; cancelled` | The session hit an approval prompt while unattended; the guard cancelled it. Re-run with a wider preset if the action is expected. |
+| `timed out …; cancelled session` | The task exceeded `--timeout`; the session was cancelled. Raise `--timeout` for long jobs. |
+| `unknown command` / exit code 2 | Typo in the subcommand — run `dsh-rpc help`. |
+
+## Limitations & gotchas
+
+- **Polling, not streaming.** Progress and completion are detected by polling
+  `session.list` / `session.history` every `DSH_POLL_MS`. There is no live token
+  stream (the WebSocket downlinks are intentionally not consumed).
+- **Workspace matching is by exact absolute path.** Symlinks are not collapsed,
+  so on macOS `/tmp/x` and `/private/tmp/x` are different paths. Running from
+  inside the target directory (the default `cwd`) avoids the mismatch.
+- **`run` always starts a fresh session.** Use `prompt <sessionId>` to continue
+  an existing one.
+- **A running dsh web server is required** for every command.
 
 ## Credits
 
