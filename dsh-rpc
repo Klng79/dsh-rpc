@@ -36,6 +36,11 @@
 
 const BASE = (process.env.DSH_URL || 'http://127.0.0.1:3080').replace(/\/+$/, '');
 const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
+// Per-request timeout for the /api bridge. dsh's server does its long-running
+// work asynchronously, so a single request should never take more than this;
+// it exists to keep a hung server from trapping the CLI forever. Override with
+// DSH_RPC_TIMEOUT_MS.
+const RPC_TIMEOUT_MS = Number(process.env.DSH_RPC_TIMEOUT_MS || 30000);
 
 function uuid() {
   const c = globalThis.crypto;
@@ -50,38 +55,58 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // cancel-on-timeout safety behavior. cancelSession is declared below; the
 // handler only runs after module load, so hoisting covers it.
 let activeSession = null;
+let cancelInFlight = false;
 
 process.on('SIGINT', () => {
   const id = activeSession;
   activeSession = null;
   process.stderr.write('\ninterrupted — cancelling session' + (id ? ' ' + id : '') + '\n');
-  if (id) cancelSession(id).catch(() => {});
-  process.exit(130);
+  process.exitCode = 130;
+  // No active session: nothing to cancel, exit now. A second Ctrl-C while a
+  // cancel is already in flight force-exits — the user clearly wants out now.
+  if (!id || cancelInFlight) { process.exit(130); return; }
+  cancelInFlight = true;
+  // process.exit() drops pending async I/O, so the fire-and-forget cancel
+  // would almost never be sent. Await the cancel (bounded, so a hung server
+  // can't trap the user forever) before exiting with the documented 130 code.
+  Promise.race([cancelSession(id), sleep(2000)])
+    .catch(() => {})
+    .finally(() => process.exit(130));
 });
 
 async function rpc(method, payload) {
   const rpcId = uuid();
-  let res;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
   try {
-    res = await fetch(`${BASE}/api/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId, method, payload: payload || {} }),
-    });
-  } catch (e) {
-    throw new Error(`cannot reach dsh at ${BASE} — is the web UI running? (${e.message})`);
+    let res;
+    try {
+      res = await fetch(`${BASE}/api/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId, method, payload: payload || {} }),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (controller.signal.aborted) {
+        throw new Error(`request to ${method} timed out after ${RPC_TIMEOUT_MS}ms`);
+      }
+      throw new Error(`cannot reach dsh at ${BASE} — is the web UI running? (${e.message})`);
+    }
+    if (!res.ok) {
+      const text = (await res.text().catch(() => '')).slice(0, 200);
+      throw new Error(`transport failure ${res.status} for ${method}${text ? ': ' + text : ''}`);
+    }
+    const full = await res.json();
+    if (!full || !full.result) throw new Error(`malformed response for ${method}`);
+    if (!full.result.ok) {
+      const err = full.result.error || {};
+      throw new Error(`${method} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`);
+    }
+    return full.result.value;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok) {
-    const text = (await res.text().catch(() => '')).slice(0, 200);
-    throw new Error(`transport failure ${res.status} for ${method}${text ? ': ' + text : ''}`);
-  }
-  const full = await res.json();
-  if (!full || !full.result) throw new Error(`malformed response for ${method}`);
-  if (!full.result.ok) {
-    const err = full.result.error || {};
-    throw new Error(`${method} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`);
-  }
-  return full.result.value;
 }
 
 /* ---- helpers ---- */
@@ -231,6 +256,64 @@ async function applyAndVerifyPermission(sessionId, permission) {
   }
 }
 
+// Build a `{ provider?, model, reasoningEffort? }` selection from the CLI flags.
+// `--model` accepts either a bare model id (disambiguated against the catalog)
+// or a `provider/model` pair; `--provider`/`--reasoning-effort` are optional
+// disambiguators/overrides. Returns null when nothing model-related was given.
+function buildModelSelection(model, provider, reasoningEffort) {
+  if (model === null && provider === null && reasoningEffort === null) return null;
+  if (model === null) throw new Error('--provider requires --model');
+  let m = model;
+  let p = provider;
+  if (p === null && model.includes('/')) {
+    const idx = model.lastIndexOf('/');
+    p = model.slice(0, idx) || null;
+    m = model.slice(idx + 1);
+    if (!p) throw new Error(`invalid --model "${model}": missing provider before "/"`);
+  }
+  if (!m) throw new Error('--model requires a model id');
+  return { model: m, provider: p || undefined, reasoningEffort: reasoningEffort || undefined };
+}
+
+// One `provider/model` string per catalog entry, for error/discovery messages.
+function describeModels(cat) {
+  const groups = cat && cat.groups ? cat.groups : [];
+  const parts = [];
+  for (const g of groups) {
+    for (const m of (g.models || [])) parts.push(`${g.id}/${m.id}`);
+  }
+  return parts.join(', ') || '(none loaded)';
+}
+
+// Apply a model selection to a session: fetch the catalog (`session.models`),
+// resolve a bare model id against it (or fill a default reasoning effort), then
+// commit via `session.selectModel`. selectModel is authoritative, but resolving
+// here gives clear errors and avoids guessing at provider/model ids.
+async function applyModelSelection(sessionId, model) {
+  const cat = await rpc('session.models', { sessionId });
+  let provider = model.provider;
+  if (!provider) {
+    const matches = [];
+    for (const g of (cat.groups || [])) {
+      for (const m of (g.models || [])) if (m.id === model.model) matches.push(g.id);
+    }
+    if (matches.length === 1) provider = matches[0];
+    else if (matches.length === 0) {
+      throw new Error(`model "${model.model}" not found for ${sessionId}; available: ${describeModels(cat)}`);
+    } else {
+      throw new Error(`model "${model.model}" is offered by multiple providers (${matches.join(', ')}); pass --provider to disambiguate`);
+    }
+  }
+  const group = (cat.groups || []).find((g) => g.id === provider);
+  const entry = group && (group.models || []).find((mm) => mm.id === model.model);
+  if (!entry) throw new Error(`model "${provider}/${model.model}" not found for ${sessionId}; available: ${describeModels(cat)}`);
+  let reasoningEffort = model.reasoningEffort;
+  if (!reasoningEffort && entry.reasoning && entry.reasoning.defaultEffort) reasoningEffort = entry.reasoning.defaultEffort;
+  const payload = { sessionId, provider, model: model.model };
+  if (reasoningEffort) payload.reasoningEffort = reasoningEffort;
+  await rpc('session.selectModel', payload);
+}
+
 async function waitForCompletion(sessionId, timeoutMs, quiet) {
   const deadline = Date.now() + timeoutMs;
   const start = Date.now();
@@ -273,17 +356,22 @@ async function waitForCompletion(sessionId, timeoutMs, quiet) {
   throw new Error(`timed out after ${timeoutMs}ms; cancelled session ${sessionId}`);
 }
 
-// Shared core for `run` and `prompt --wait`: set+verify the permission (if
-// requested), enqueue the prompt, then either print the session id immediately
-// (`onIdle`) or wait for completion and print the final assistant text.
-// Whether to cancel the session on error is left to the caller: `run` cancels
-// its freshly-created session, `prompt` does not (that session may pre-exist).
-async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs, onIdle }) {
+// Shared core for `run`, `prompt --wait` and `fork --no-wait`/text: apply the
+// model selection (if requested), set+verify the permission (if requested),
+// enqueue the prompt, then either print the session id immediately (`onIdle`)
+// or wait for completion and print the final assistant text. Whether to cancel
+// the session on error is left to the caller: `run`/`fork` cancel their
+// freshly-created session, `prompt` does not (that session may pre-exist).
+async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs, model, onIdle }) {
   activeSession = sessionId;
   try {
     if (permission) {
       await applyAndVerifyPermission(sessionId, permission);
       if (!quiet) console.error(`verified permission ${permission}`);
+    }
+    if (model) {
+      await applyModelSelection(sessionId, model);
+      if (!quiet) console.error(`selected model ${model.provider}/${model.model}`);
     }
     await rpc('session.prompt', {
       sessionId,
@@ -332,6 +420,9 @@ async function cmdRun(args) {
   let permission = null;
   let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
+  let model = null;
+  let modelProvider = null;
+  let reasoningEffort = null;
   const taskParts = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -341,11 +432,15 @@ async function cmdRun(args) {
     else if (a === '--no-wait') { wait = false; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
     else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
+    else if (a === '--model') { model = nextValue(args, i, '--model'); i++; }
+    else if (a === '--provider') { modelProvider = nextValue(args, i, '--provider'); i++; }
+    else if (a === '--reasoning-effort') { reasoningEffort = nextValue(args, i, '--reasoning-effort'); i++; }
     else { taskParts.push(a); }
   }
   const task = taskParts.join(' ').trim();
-  if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--permission <mode>] [--no-wait] [--timeout <sec>]');
+  if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>]');
   if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  const modelSel = buildModelSelection(model, modelProvider, reasoningEffort);
 
   const absPath = resolvePath(workspacePath);
   const workspace = await ensureWorkspace(absPath);
@@ -355,7 +450,7 @@ async function cmdRun(args) {
   if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
 
   try {
-    await runSession({ sessionId, task, wait, quiet, permission, timeoutMs, onIdle: () => console.log(sessionId) });
+    await runSession({ sessionId, task, wait, quiet, permission, timeoutMs, model: modelSel, onIdle: () => console.log(sessionId) });
   } catch (e) {
     // this is a fresh session we created — cancel it so a failed run doesn't leave it running
     await cancelSession(sessionId).catch(() => {});
@@ -369,6 +464,9 @@ async function cmdPrompt(args) {
   let permission = null;
   let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
+  let model = null;
+  let modelProvider = null;
+  let reasoningEffort = null;
   const rest = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -377,15 +475,19 @@ async function cmdPrompt(args) {
     else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
     else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
+    else if (a === '--model') { model = nextValue(args, i, '--model'); i++; }
+    else if (a === '--provider') { modelProvider = nextValue(args, i, '--provider'); i++; }
+    else if (a === '--reasoning-effort') { reasoningEffort = nextValue(args, i, '--reasoning-effort'); i++; }
     else { rest.push(a); }
   }
   const sessionId = rest[0];
   const text = rest.slice(1).join(' ').trim();
-  if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--permission <mode>] [--timeout <sec>] [--quiet] <text…>');
+  if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--permission <mode>] [--model <model>] [--timeout <sec>] [--quiet] <text…>');
   if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  const modelSel = buildModelSelection(model, modelProvider, reasoningEffort);
   // runSession does NOT cancel this session on error — it may pre-exist and
   // belong to prior work, unlike the fresh session created by `run`.
-  await runSession({ sessionId, task: text, wait, quiet, permission, timeoutMs, onIdle: () => console.log(`accepted session ${sessionId}`) });
+  await runSession({ sessionId, task: text, wait, quiet, permission, timeoutMs, model: modelSel, onIdle: () => console.log(`accepted session ${sessionId}`) });
 }
 
 // CLI-level acknowledgement guard (no server call): the full-access preset is
@@ -396,6 +498,69 @@ function checkPermissionAck(permission, allowDangerFullAccess) {
   if (permission === 'danger-full-access' && !allowDangerFullAccess) {
     throw new Error('permission danger-full-access requires the explicit --allow-danger-full-access acknowledgement');
   }
+}
+
+// dsh-rpc fork <sessionId> [--at-seq <n>] [--model <model>] [--permission <mode>] [--no-wait] [--timeout <sec>] [<text…>]
+// Branch an existing session via `session.fork` (the child keeps the parent's
+// workspace grouping). With no text, print the child id and stop. With text,
+// continue the child (same semantics as `run`, including cancel-on-error since
+// the child is freshly created).
+async function cmdFork(args) {
+  let atSeq;
+  let wait = true;
+  let quiet = false;
+  let permission = null;
+  let allowDangerFullAccess = false;
+  let timeoutMs = 10 * 60 * 1000;
+  let model = null;
+  let modelProvider = null;
+  let reasoningEffort = null;
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--at-seq') { atSeq = Number(nextValue(args, i, '--at-seq')); if (!Number.isInteger(atSeq) || atSeq < 0) throw new Error('--at-seq must be a non-negative integer'); i++; }
+    else if (a === '--no-wait') { wait = false; }
+    else if (a === '--quiet' || a === '-q') { quiet = true; }
+    else if (a === '--permission' || a === '-p') { permission = nextValue(args, i, '--permission'); i++; }
+    else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
+    else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
+    else if (a === '--model') { model = nextValue(args, i, '--model'); i++; }
+    else if (a === '--provider') { modelProvider = nextValue(args, i, '--provider'); i++; }
+    else if (a === '--reasoning-effort') { reasoningEffort = nextValue(args, i, '--reasoning-effort'); i++; }
+    else { rest.push(a); }
+  }
+  const sessionId = rest[0];
+  const text = rest.slice(1).join(' ').trim();
+  if (!sessionId) throw new Error('usage: dsh-rpc fork <sessionId> [--at-seq <n>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>] [<text…>]');
+  if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  const modelSel = buildModelSelection(model, modelProvider, reasoningEffort);
+
+  const payload = { sessionId };
+  if (atSeq !== undefined) payload.atSeq = atSeq;
+  const child = await rpc('session.fork', payload);
+  const childId = child.sessionId;
+  if (!quiet) console.error(`forked ${sessionId} -> ${childId}`);
+
+  if (!text) { console.log(childId); return; }
+
+  try {
+    await runSession({ sessionId: childId, task: text, wait, quiet, permission, timeoutMs, model: modelSel, onIdle: () => console.log(childId) });
+  } catch (e) {
+    // the child is a session we just created — cancel it so a failed run doesn't leave it running
+    await cancelSession(childId).catch(() => {});
+    throw e;
+  }
+}
+
+// dsh-rpc search <query> — search the deployment's session history.
+async function cmdSearch(args) {
+  const query = args.join(' ').trim();
+  if (!query) throw new Error('usage: dsh-rpc search <query>');
+  const res = await rpc('session.search', { query });
+  const items = res.items || [];
+  if (!items.length) { console.log('(no matches)'); return; }
+  for (const it of items) console.log(`${it.sessionId}\t${it.snippet}`);
+  if (res.hasMore) console.error('(more results available)');
 }
 
 async function cmdHistory(args) {
@@ -438,11 +603,17 @@ Usage:
        --permission,-p <mode>              set+verify session permission before the task
                                            (preset must be offered by the deployment; e.g. read-only)
        --allow-danger-full-access          required acknowledgement for danger-full-access
+       --model <model>                     select the model: a bare id, or <provider>/<model>
+       --provider <name>                   disambiguate --model across providers (optional)
+       --reasoning-effort <id>             reasoning effort for --model (optional)
        --no-wait                           return the session id immediately
        --timeout <sec>                     max wait, then cancel (default 600)
        --quiet,-q                          suppress progress
   dsh-rpc prompt <sessionId> <text…>       send a prompt to an existing session
-       --wait [--permission <mode>] [--timeout <sec>] [--quiet]
+       --wait [--permission <mode>] [--model <model>] [--timeout <sec>] [--quiet]
+  dsh-rpc fork <sessionId> [<text…>]       branch an existing session (child keeps workspace grouping)
+       [--at-seq <n>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>]
+  dsh-rpc search <query>                   search the deployment's session history
   dsh-rpc history <sessionId>              print a session's messages
   dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session.list '{}')
 
@@ -463,6 +634,8 @@ async function main() {
     case 'sessions': return cmdSessions();
     case 'run': return cmdRun(rest);
     case 'prompt': return cmdPrompt(rest);
+    case 'fork': return cmdFork(rest);
+    case 'search': return cmdSearch(rest);
     case 'history': return cmdHistory(rest);
     case 'call': return cmdCall(rest);
     case 'help': case '--help': case '-h': case undefined:

@@ -62,13 +62,21 @@ dsh-rpc run <task…> [opts]              create a grouped session, send task, w
       --permission,-p <mode>            set+verify the session permission before the task:
                                         read-only | workspace-write | danger-full-access
       --allow-danger-full-access        required acknowledgement for danger-full-access
+      --model <model>                   select the model: a bare id, or <provider>/<model>
+      --provider <name>                 disambiguate --model across providers (optional)
+      --reasoning-effort <id>           reasoning effort for --model (optional)
       --no-wait                         return the session id immediately
       --timeout <sec>                   max wait, then cancel (default 600)
       --quiet,-q                        suppress progress
 dsh-rpc prompt <sessionId> [opts] <text…>  send a follow-up to an existing session
       --wait                            wait for completion and print the result
       --permission,-p <mode>            (optional) change the permission first
+      --model <model>                   (optional) switch the model first
       --timeout <sec>                   max wait, then cancel (default 600)
+dsh-rpc fork <sessionId> [<text…>] [opts]  branch an existing session (child keeps workspace grouping)
+      --at-seq <n>                      cut the branch at a specific history seq (optional)
+      --no-wait --permission,-p <mode> --model <model> --timeout <sec> --quiet
+dsh-rpc search <query>                  search the deployment's session history
 dsh-rpc history <sessionId>             print a session's messages
 dsh-rpc call <method> [json]            raw RPC escape hatch
 ```
@@ -85,6 +93,21 @@ dsh-rpc run "refactor the logger" --workspace /path/to/my/project --no-wait
 
 # Follow up in the same session
 dsh-rpc prompt session-xxxx --wait "commit the passing tests"
+
+# Run against a specific model (bare id is resolved uniquely against the catalog)
+dsh-rpc run "refactor the logger" --model deepseek-chat
+
+# Disambiguate a model id that multiple providers offer
+dsh-rpc run "audit the codebase" --model deepseek-chat --provider my-provider
+
+# Branch an existing session and continue it (child keeps the workspace grouping)
+dsh-rpc fork session-xxxx "also handle the edge case"
+
+# Fork without continuing — just get the child session id
+dsh-rpc fork session-xxxx
+
+# Search across the deployment's session history
+dsh-rpc search "refactor logger"
 
 # Constrain a run to read-only (permission is applied + verified before the task)
 dsh-rpc run "audit the codebase for TODOs" --permission read-only
@@ -106,6 +129,7 @@ dsh-rpc call workspace.list '{}'
 |---------|---------|---------|
 | `DSH_URL` | `http://127.0.0.1:3080` | dsh web server base URL |
 | `DSH_POLL_MS` | `1000` | completion poll period (ms) |
+| `DSH_RPC_TIMEOUT_MS` | `30000` | per-request timeout for the `/api` bridge (ms) |
 
 ## Permission presets
 
@@ -148,7 +172,9 @@ that spawns the CLI against an in-process mock of the `/api` bridge — no real
 dsh server needed. It covers the RPC envelope, trailing-slash `DSH_URL`,
 `--timeout`/missing-value validation, completion detection, the approval →
 cancel path, the non-completed terminal-reason gate, deployment-aware
-`--permission` validation, and the shared `run`/`prompt` completion path.
+`--permission` validation, the shared `run`/`prompt` completion path, `fork`,
+`search`, and `--model` resolution (bare id, ambiguity, and `--provider`
+validation).
 
 ## How it works
 
@@ -172,7 +198,9 @@ loopback-only by design.
 Methods used here: `workspace.list`, `workspace.create`, `workspace.delete`,
 `session.create` (passing `workspaceId` attaches/groups the session),
 `session.prompt`, `session.list` (carries the `running` flag),
-`session.history`, `session.cancel`, and `commands/execute` (permission presets).
+`session.history`, `session.fork` (branching), `session.search`,
+`session.models` + `session.selectModel` (`--model`),
+`session.cancel`, and `commands/execute` (permission presets).
 
 **Completion detection** polls `session.list` for the session's `running` flag
 (the same signal the host broadcasts over the `/api/events.host` WebSocket),
@@ -220,7 +248,7 @@ These opt-in guards harden unattended runs. They are additive — the default
   so on macOS `/tmp/x` and `/private/tmp/x` are different paths. Running from
   inside the target directory (the default `cwd`) avoids the mismatch.
 - **`run` always starts a fresh session.** Use `prompt <sessionId>` to continue
-  an existing one.
+  an existing one, or `fork <sessionId>` to branch off it into a new session.
 - **A running dsh web server is required** for every command.
 
 ## Credits
@@ -232,7 +260,11 @@ completion gate, and the approval/timeout-cancel behavior were adapted from
 
 ## Verified against
 
-- `@deepseek-ai/dsh` v0.1.0-rc.6
+- `@deepseek-ai/dsh` v0.1.0-rc.7
+
+`dsh-rpc` targets the `/api` RPC surface used by the web UI. In rc.7 that
+surface is unchanged from rc.6 for every method this tool calls, so the two
+versions are interchangeable here.
 
 ## License
 
