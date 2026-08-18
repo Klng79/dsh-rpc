@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "description": "Drive DeepSeek Harness (dsh) programmatically via its local /api RPC bridge - with grouped sessions.",
   "license": "MIT",
+  "author": "Alex Ng",
+  "repository": { "type": "git", "url": "git+https://github.com/Klng79/dsh-rpc.git" },
+  "keywords": ["dsh", "deepseek-harness", "rpc", "cli"],
+  "files": ["dsh-rpc"],
   "bin": { "dsh-rpc": "dsh-rpc" },
   "scripts": { "test": "node --test" },
   "engines": { "node": ">=18" }
