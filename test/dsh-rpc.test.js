@@ -14,6 +14,8 @@ const assert = require('node:assert');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 
 const CLI = path.join(__dirname, '..', 'dsh-rpc');
 
@@ -22,7 +24,10 @@ const CLI = path.join(__dirname, '..', 'dsh-rpc');
 // Returning HANG leaves the request open (never responds) to simulate a hung server.
 const HANG = Symbol('hang');
 
-function startMock(handler) {
+function startMock(handler, options = {}) {
+  const autoGuardState = options.autoGuardState !== false;
+  let activePermission = 'read-only';
+  let promptAccepted = false;
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       let body = '';
@@ -45,6 +50,26 @@ function startMock(handler) {
           result = { ok: false, error: { code: 'mock', message: String((e && e.message) || e) } };
         }
         if (result === HANG) return; // leave the socket open — simulates a hung server
+        if (autoGuardState && result && result.ok) {
+          if (record.method === 'commands/execute') {
+            const line = record.payload && record.payload.args && record.payload.args.line;
+            if (typeof line === 'string' && line.startsWith('/permission ')) activePermission = line.slice('/permission '.length);
+            if (result.value == null) result = ok({ result: { kind: 'success', text: 'ok' } });
+          } else if (record.method === 'session.history') {
+            const value = result.value || { events: [], projections: { values: {} } };
+            value.events = promptAccepted ? (value.events || []) : [];
+            value.projections = value.projections || { values: {} };
+            value.projections.values = value.projections.values || {};
+            value.projections.values.permissions = value.projections.values.permissions || {};
+            if (value.projections.values.permissions.currentValue == null) {
+              value.projections.values.permissions.currentValue = activePermission;
+            }
+            result = ok(value);
+          } else if (record.method === 'session.prompt') {
+            promptAccepted = true;
+            if (result.value == null) result = ok({ accepted: true });
+          }
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ type: 'server-response', rpcId: reqData.rpcId, result }));
       });
@@ -154,8 +179,7 @@ test('run: a pending approval cancels the session instead of hanging', async () 
   const { server, port } = await startMock((r) => {
     calls.push(r.method);
     switch (r.method) {
-      case 'workspace.list': return ok({ items: [] });
-      case 'workspace.create': return ok({ workspace: WS('ws1', 'T', ['sess-1']) });
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', ['sess-1'])] });
       case 'session.create': return ok({ sessionId: 'sess-1' });
       case 'session.prompt': return ok(null);
       case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: true }] });
@@ -514,5 +538,323 @@ test('run: Ctrl-C cancels the active session before exiting (code 130)', async (
   }
 });
 
+test('guard: run defaults to read-only and verifies it before prompt admission', async () => {
+  const calls = [];
+  const { server, port } = await startMock((r) => {
+    calls.push([r.method, r.payload]);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'inspect only', '--no-wait', '--json'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.strictEqual(JSON.parse(res.out).permission, 'read-only');
+    const methods = calls.map(([method]) => method);
+    const permissionIndex = methods.indexOf('commands/execute');
+    const promptIndex = methods.indexOf('session.prompt');
+    assert.ok(permissionIndex >= 0 && permissionIndex < promptIndex);
+    assert.strictEqual(calls[permissionIndex][1].args.line, '/permission read-only');
+  } finally {
+    server.close();
+  }
+});
 
+test('guard: missing workspace fails closed without creating anything', async () => {
+  const calls = [];
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    if (r.method === 'workspace.list') return ok({ items: [] });
+    return ok(null);
+  });
+  try {
+    const res = await runCli(['run', 'task'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /not registered/);
+    assert.deepStrictEqual(calls, ['workspace.list']);
+  } finally {
+    server.close();
+  }
+});
 
+test('guard: --create-workspace preserves opt-in workspace creation', async () => {
+  const calls = [];
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [] });
+      case 'workspace.create': return ok({ workspace: WS('ws1', 'Created', []) });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'task', '--create-workspace', '--no-wait'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.ok(calls.includes('workspace.create'));
+    assert.ok(calls.includes('session.prompt'));
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: absent permission projection fails verification and cancels', async () => {
+  const calls = [];
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'session.history': return ok({ events: [], projections: { values: {} } });
+      case 'commands/execute': return ok({ result: { kind: 'success' } });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  }, { autoGuardState: false });
+  try {
+    const res = await runCli(['run', 'task'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /got unknown/);
+    assert.ok(calls.includes('session.cancel'));
+    assert.ok(!calls.includes('session.prompt'));
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: missing new turn/end never reports success', async () => {
+  const calls = [];
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      case 'session.history': return ok({
+        events: [{ event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'stale-looking result' }] } } } }],
+        projections: { values: {} },
+      });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'task', '--timeout', '0.05'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /timed out/);
+    assert.ok(calls.includes('session.cancel'));
+    assert.doesNotMatch(res.out, /stale-looking result/);
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: permission drift after admission cancels the session', async () => {
+  const calls = [];
+  let applied = false;
+  let prompted = false;
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'commands/execute': applied = true; return ok({ result: { kind: 'success' } });
+      case 'session.prompt': prompted = true; return ok({ accepted: true });
+      case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: true }] });
+      case 'session.history': return ok({
+        events: [],
+        projections: { values: { permissions: { currentValue: prompted ? 'workspace-write' : (applied ? 'read-only' : 'danger-full-access') } } },
+      });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  }, { autoGuardState: false });
+  try {
+    const res = await runCli(['run', 'task'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /permission changed/);
+    assert.ok(calls.includes('session.cancel'));
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: rejected prompt admission fails and cancels a fresh session', async () => {
+  const calls = [];
+  let applied = false;
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'commands/execute': applied = true; return ok({ result: { kind: 'success' } });
+      case 'session.history': return ok({ events: [], projections: { values: { permissions: { currentValue: applied ? 'read-only' : 'danger-full-access' } } } });
+      case 'session.prompt': return ok({ accepted: false });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  }, { autoGuardState: false });
+  try {
+    const res = await runCli(['run', 'task'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /did not accept/);
+    assert.ok(calls.includes('session.cancel'));
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: stale turn/end from an earlier prompt is not reused', async () => {
+  const calls = [];
+  const oldEvents = [
+    { seq: 1, event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'old answer' }] } } } },
+    { seq: 2, event: { type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+  ];
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'commands/execute': return ok({ result: { kind: 'success' } });
+      case 'session.history': return ok({ events: oldEvents, projections: { values: { permissions: { currentValue: 'read-only' } } } });
+      case 'session.prompt': return ok({ accepted: true });
+      case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  }, { autoGuardState: false });
+  try {
+    const res = await runCli(['prompt', 'sess-1', 'new question', '--wait', '--timeout', '0.05'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /timed out/);
+    assert.doesNotMatch(res.out, /old answer/);
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: unknown option is rejected before any RPC', async () => {
+  let hit = false;
+  const { server, port } = await startMock(() => { hit = true; return ok(null); });
+  try {
+    const res = await runCli(['run', 'task', '--permisson', 'read-only'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /unknown option/);
+    assert.strictEqual(hit, false);
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: mutating raw RPC requires an explicit acknowledgement', async () => {
+  let hit = false;
+  const { server, port } = await startMock(() => { hit = true; return ok(null); });
+  try {
+    const denied = await runCli(['call', 'workspace.delete', '{}'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(denied.code, 1);
+    assert.match(denied.err, /allow-unsafe-call/);
+    assert.strictEqual(hit, false);
+
+    const allowed = await runCli(['call', '--allow-unsafe-call', 'workspace.delete', '{}'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(allowed.code, 0);
+    assert.strictEqual(hit, true);
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: workspace title mismatch fails before session creation', async () => {
+  const calls = [];
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    if (r.method === 'workspace.list') return ok({ items: [WS('ws1', 'Actual title', [])] });
+    return ok(null);
+  });
+  try {
+    const res = await runCli(['run', 'task', '--require-title', 'Expected title'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /title mismatch/);
+    assert.ok(!calls.includes('session.create'));
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: mismatched terminal job marker is rejected', async () => {
+  const calls = [];
+  let listCalls = 0;
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'session.list': { listCalls++; return ok({ items: [{ sessionId: 'sess-1', running: listCalls < 2 }] }); }
+      case 'session.history': return ok({
+        events: [
+          { event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done\nDEEPSEEK_DONE:wrong-job' }] } } } },
+          { event: { type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+        ],
+        projections: { values: {} },
+      });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'task', '--job-id', 'expected-job'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /matching marker/);
+    assert.ok(calls.includes('session.cancel'));
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: status emits structured permission and completion evidence', async () => {
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      case 'session.history': return ok({
+        events: [
+          { event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done\nDEEPSEEK_DONE:job-1' }] } } } },
+          { event: { type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+        ],
+        projections: { values: { permissions: { currentValue: 'read-only' } } },
+      });
+      default: return ok(null);
+    }
+  }, { autoGuardState: false });
+  try {
+    const res = await runCli(['status', 'sess-1', '--job-id', 'job-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    const value = JSON.parse(res.out);
+    assert.strictEqual(value.permission, 'read-only');
+    assert.strictEqual(value.turnEndReason, 'completed');
+    assert.strictEqual(value.outcome, 'DONE');
+  } finally {
+    server.close();
+  }
+});
+
+test('guard: --task-file submits multiline text without mixing positional text', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rpc-test-'));
+  const taskFile = path.join(tempDir, 'task.txt');
+  fs.writeFileSync(taskFile, 'line one\nline two\n');
+  let submittedText;
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', [])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'session.prompt': submittedText = r.payload.content[0].text; return ok(null);
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', '--task-file', taskFile, '--no-wait'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.strictEqual(submittedText, 'line one\nline two');
+  } finally {
+    server.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

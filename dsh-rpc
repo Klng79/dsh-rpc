@@ -36,6 +36,8 @@
 
 const BASE = (process.env.DSH_URL || 'http://127.0.0.1:3080').replace(/\/+$/, '');
 const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
+const BUILD_ID = 'jnsys-guarded-2';
+const SOURCE_URL = 'https://github.com/jnsys/dsh-rpc';
 // Per-request timeout for the /api bridge. dsh's server does its long-running
 // work asynchronously, so a single request should never take more than this;
 // it exists to keep a hung server from trapping the CLI forever. Override with
@@ -98,7 +100,9 @@ async function rpc(method, payload) {
       throw new Error(`transport failure ${res.status} for ${method}${text ? ': ' + text : ''}`);
     }
     const full = await res.json();
-    if (!full || !full.result) throw new Error(`malformed response for ${method}`);
+    if (!full || full.type !== 'server-response' || full.rpcId !== rpcId || !full.result) {
+      throw new Error(`malformed or mismatched response for ${method}`);
+    }
     if (!full.result.ok) {
       const err = full.result.error || {};
       throw new Error(`${method} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`);
@@ -112,11 +116,17 @@ async function rpc(method, payload) {
 /* ---- helpers ---- */
 
 function resolvePath(p) {
-  if (!p) return process.cwd();
-  if (p === '~') return process.env.HOME;
-  if (p.indexOf('~/') === 0) return process.env.HOME + p.slice(1);
-  if (p.indexOf('/') === 0) return p;
-  return process.cwd() + '/' + p;
+  let value = p || process.cwd();
+  if (value === '~') value = process.env.HOME;
+  else if (value.indexOf('~/') === 0) value = process.env.HOME + value.slice(1);
+  else if (value.indexOf('/') !== 0) value = process.cwd() + '/' + value;
+  const normalized = [];
+  for (const part of value.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') normalized.pop();
+    else normalized.push(part);
+  }
+  return '/' + normalized.join('/');
 }
 
 // Return the value that follows a --flag at args[flagIndex], or throw a clear
@@ -151,12 +161,20 @@ async function listWorkspaces() {
 
 async function findWorkspaceByPath(absPath) {
   const items = await listWorkspaces();
-  return items.find((w) => w.path === absPath);
+  return items.find((w) => resolvePath(w.path) === absPath);
 }
 
-async function ensureWorkspace(absPath) {
+async function requireWorkspace(absPath, requireTitle, createWorkspace) {
   const existing = await findWorkspaceByPath(absPath);
-  if (existing) return existing;
+  if (existing) {
+    if (requireTitle && existing.title !== requireTitle) {
+      throw new Error(`workspace title mismatch: expected ${JSON.stringify(requireTitle)}, got ${JSON.stringify(existing.title)}`);
+    }
+    return existing;
+  }
+  if (!createWorkspace) {
+    throw new Error(`required workspace is not registered: ${absPath}; pass --create-workspace to create it explicitly`);
+  }
   const created = await rpc('workspace.create', { path: absPath });
   return created.workspace;
 }
@@ -165,10 +183,33 @@ async function getHistory(sessionId) {
   return rpc('session.history', { sessionId, maxMessages: 200 });
 }
 
-function finalAssistantText(history) {
+function eventSequence(entry) {
+  const values = [entry && entry.seq, entry && entry.sequence, entry && entry.event && entry.event.seq];
+  return values.find((value) => Number.isFinite(value));
+}
+
+function historyCheckpoint(history) {
+  const events = (history && history.events) || [];
+  let maxSeq;
+  for (const entry of events) {
+    const seq = eventSequence(entry);
+    if (seq !== undefined && (maxSeq === undefined || seq > maxSeq)) maxSeq = seq;
+  }
+  return { length: events.length, maxSeq };
+}
+
+function isAfterCheckpoint(entry, index, checkpoint) {
+  if (!checkpoint) return true;
+  const seq = eventSequence(entry);
+  if (checkpoint.maxSeq !== undefined && seq !== undefined) return seq > checkpoint.maxSeq;
+  return index >= checkpoint.length;
+}
+
+function finalAssistantText(history, checkpoint) {
   const events = (history && history.events) || [];
   // walk newest-to-oldest; return the last assistant message that has visible text
   for (let i = events.length - 1; i >= 0; i--) {
+    if (!isAfterCheckpoint(events[i], i, checkpoint)) continue;
     const ev = events[i].event || events[i];
     if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
       const text = textOf(ev.data.message);
@@ -191,9 +232,10 @@ function currentPermission(history) {
   return undefined;
 }
 
-function latestTurnEnd(history) {
+function latestTurnEnd(history, checkpoint) {
   const events = (history && history.events) || [];
   for (let i = events.length - 1; i >= 0; i--) {
+    if (!isAfterCheckpoint(events[i], i, checkpoint)) continue;
     const ev = events[i].event || events[i];
     if (ev.type === 'turn/end') return ev;
   }
@@ -209,6 +251,13 @@ function pendingApproval(history) {
   }
   const first = pending.values().next();
   return first.done ? undefined : first.value;
+}
+
+function markerOutcome(text, jobId) {
+  if (!jobId) return undefined;
+  const escaped = jobId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = text.match(new RegExp(`(?:^|\\n)DEEPSEEK_(DONE|BLOCKED|NEEDS_INPUT):${escaped}\\s*$`));
+  return match && match[1];
 }
 
 function cancelSession(sessionId) {
@@ -251,8 +300,8 @@ async function applyAndVerifyPermission(sessionId, permission) {
   }
   const verified = await getHistory(sessionId);
   const actual = currentPermission(verified);
-  if (actual && actual !== permission) {
-    throw new Error(`permission verification failed for ${sessionId}: expected ${permission}, got ${actual}`);
+  if (actual !== permission) {
+    throw new Error(`permission verification failed for ${sessionId}: expected ${permission}, got ${actual || 'unknown'}`);
   }
 }
 
@@ -314,79 +363,86 @@ async function applyModelSelection(sessionId, model) {
   await rpc('session.selectModel', payload);
 }
 
-async function waitForCompletion(sessionId, timeoutMs, quiet) {
-  const deadline = Date.now() + timeoutMs;
+async function waitForCompletion(sessionId, options, checkpoint) {
+  const deadline = Date.now() + options.timeoutMs;
   const start = Date.now();
-  let sawRunning = false;
   while (Date.now() < deadline) {
-    let summary;
-    let history;
-    try {
-      const list = await rpc('session.list', {});
-      summary = (list.items || []).find((i) => i.sessionId === sessionId);
-      history = await getHistory(sessionId);
-    } catch (e) {
-      /* transient server hiccup — keep polling */
+    const list = await rpc('session.list', {});
+    const summary = (list.items || []).find((i) => i.sessionId === sessionId);
+    if (!summary) throw new Error(`session disappeared while monitoring: ${sessionId}`);
+    const history = await getHistory(sessionId);
+    const approval = pendingApproval(history);
+    if (approval) {
+      await cancelSession(sessionId).catch(() => {});
+      throw new Error(`session requested approval for ${approval.toolName || 'an operation'}; cancelled`);
     }
-    if (history) {
-      const approval = pendingApproval(history);
-      if (approval) {
-        await cancelSession(sessionId).catch(() => {});
-        throw new Error(`session requested approval for ${approval.toolName || 'an operation'}; cancelled`);
-      }
+    const actualPermission = currentPermission(history);
+    if (actualPermission !== options.permission) {
+      await cancelSession(sessionId).catch(() => {});
+      throw new Error(`permission changed while running: expected ${options.permission}, got ${actualPermission || 'unknown'}`);
     }
-    if (summary && summary.running) sawRunning = true;
-    const graceDone = sawRunning || (Date.now() - start > 3000);
-    if (summary && summary.running === false && graceDone) {
-      // stronger completion gate: surface a non-"completed" terminal reason
-      const turnEnd = history ? latestTurnEnd(history) : undefined;
+    const turnEnd = latestTurnEnd(history, checkpoint);
+    if (summary.running === false && turnEnd) {
       const kind = turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : undefined;
-      if (kind && kind !== 'completed') {
-        throw new Error(`session ended with reason "${kind}" (not completed)`);
+      if (kind !== 'completed') {
+        throw new Error(`session ended with reason "${kind || 'unknown'}" (not completed)`);
       }
-      return;
+      const assistantText = finalAssistantText(history, checkpoint);
+      const outcome = markerOutcome(assistantText, options.jobId);
+      if (options.jobId && !outcome) {
+        throw new Error(`protocol failure: final assistant response lacks a matching marker for ${options.jobId}`);
+      }
+      return {
+        sessionId,
+        running: false,
+        elapsedMs: Date.now() - start,
+        permission: actualPermission,
+        turnEndReason: kind,
+        outcome: outcome || null,
+        assistantText,
+      };
     }
-    if (!quiet) {
+    if (!options.quiet) {
       const secs = Math.round((Date.now() - start) / 1000);
-      process.stderr.write(`\r  dsh working… ${secs}s${summary && summary.running ? ' (running)' : ''}   `);
+      process.stderr.write(`\r  dsh working… ${secs}s${summary.running ? ' (running)' : ' (queued)'}   `);
     }
-    await sleep(POLL_MS);
+    await sleep(options.pollMs);
   }
   await cancelSession(sessionId).catch(() => {});
-  throw new Error(`timed out after ${timeoutMs}ms; cancelled session ${sessionId}`);
+  throw new Error(`timed out after ${options.timeoutMs}ms; cancelled session ${sessionId}`);
 }
 
 // Shared core for `run`, `prompt --wait` and `fork --no-wait`/text: apply the
 // model selection (if requested), set+verify the permission (if requested),
-// enqueue the prompt, then either print the session id immediately (`onIdle`)
-// or wait for completion and print the final assistant text. Whether to cancel
-// the session on error is left to the caller: `run`/`fork` cancel their
-// freshly-created session, `prompt` does not (that session may pre-exist).
-async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs, model, onIdle }) {
+// enqueue the prompt, then return admission evidence immediately or wait for
+// strict completion evidence. Whether to cancel on a later caller-level error
+// is left to the caller: `run`/`fork` own fresh sessions, while `prompt` may
+// target a pre-existing session.
+async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs, pollMs, model, jobId }) {
   activeSession = sessionId;
   try {
-    if (permission) {
-      await applyAndVerifyPermission(sessionId, permission);
-      if (!quiet) console.error(`verified permission ${permission}`);
-    }
+    await applyAndVerifyPermission(sessionId, permission);
+    if (!quiet) console.error(`verified permission ${permission}`);
     if (model) {
       await applyModelSelection(sessionId, model);
-      if (!quiet) console.error(`selected model ${model.provider}/${model.model}`);
+      if (!quiet) console.error(`selected model ${model.provider ? model.provider + '/' : ''}${model.model}`);
     }
-    await rpc('session.prompt', {
+    const beforePrompt = await getHistory(sessionId);
+    const checkpoint = historyCheckpoint(beforePrompt);
+    const accepted = await rpc('session.prompt', {
       sessionId,
       mode: 'queue',
       content: [{ type: 'text', text: task }],
     });
-    if (!wait) {
-      onIdle();
-      return;
+    if (!accepted || accepted.accepted !== true) {
+      throw new Error(`Harness did not accept the task for ${sessionId}`);
     }
-    await waitForCompletion(sessionId, timeoutMs, quiet);
+    if (!wait) {
+      return { sessionId, permission, accepted: true };
+    }
+    const result = await waitForCompletion(sessionId, { timeoutMs, pollMs, quiet, permission, jobId }, checkpoint);
     if (!quiet) process.stderr.write('\n');
-    const history = await getHistory(sessionId);
-    console.log(finalAssistantText(history) || '(no assistant text captured — use `dsh-rpc history ' + sessionId + '`)');
-    console.error(`\n[done] session ${sessionId}`);
+    return result;
   } finally {
     activeSession = null;
   }
@@ -394,17 +450,44 @@ async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs,
 
 /* ---- commands ---- */
 
-async function cmdWorkspaces() {
+async function readTaskFile(file) {
+  const fs = await import('node:fs/promises');
+  return (await fs.readFile(file, 'utf8')).trim();
+}
+
+function printResult(result, json, fallback) {
+  console.log(json ? JSON.stringify(result, null, 2) : fallback);
+}
+
+function parseDisplayMode(args, command) {
+  let table = false;
+  for (const arg of args) {
+    if (arg === '--table') table = true;
+    else if (arg === '--json') table = false;
+    else throw new Error(`unknown ${command} option: ${arg}`);
+  }
+  return table;
+}
+
+async function cmdWorkspaces(args) {
   const items = await listWorkspaces();
+  if (!parseDisplayMode(args, 'workspaces')) {
+    console.log(JSON.stringify(items, null, 2));
+    return;
+  }
   if (!items.length) { console.log('(no workspaces)'); return; }
   for (const w of items) {
     console.log(`${w.workspaceId}  ${w.title}  [${w.sessionIds.length} sessions]  ${w.path}`);
   }
 }
 
-async function cmdSessions() {
+async function cmdSessions(args) {
   const list = await rpc('session.list', {});
   const items = list.items || [];
+  if (!parseDisplayMode(args, 'sessions')) {
+    console.log(JSON.stringify(items, null, 2));
+    return;
+  }
   if (!items.length) { console.log('(no sessions)'); return; }
   for (const s of items) {
     const flags = [s.running ? 'running' : 'idle', s.blank ? 'blank' : 'has-history'].join(',');
@@ -413,44 +496,64 @@ async function cmdSessions() {
 }
 
 async function cmdRun(args) {
-  // parse flags
   let workspacePath = null;
+  let requireTitle;
+  let createWorkspace = false;
   let wait = true;
   let quiet = false;
-  let permission = null;
+  let json = false;
+  let permission = 'read-only';
   let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
+  let pollMs = POLL_MS;
   let model = null;
   let modelProvider = null;
   let reasoningEffort = null;
+  let jobId;
+  let taskFile;
   const taskParts = [];
+  let literal = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--workspace' || a === '-w') { workspacePath = nextValue(args, i, '--workspace'); i++; }
+    if (literal) { taskParts.push(a); continue; }
+    if (a === '--') { literal = true; }
+    else if (a === '--workspace' || a === '-w') { workspacePath = nextValue(args, i, '--workspace'); i++; }
+    else if (a === '--require-title') { requireTitle = nextValue(args, i, '--require-title'); i++; }
+    else if (a === '--create-workspace') { createWorkspace = true; }
     else if (a === '--permission' || a === '-p') { permission = nextValue(args, i, '--permission'); i++; }
     else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--no-wait') { wait = false; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
+    else if (a === '--json') { json = true; }
     else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
+    else if (a === '--poll-ms') { pollMs = Number(nextValue(args, i, '--poll-ms')); if (!Number.isFinite(pollMs) || pollMs <= 0) throw new Error('--poll-ms must be a positive number'); i++; }
     else if (a === '--model') { model = nextValue(args, i, '--model'); i++; }
     else if (a === '--provider') { modelProvider = nextValue(args, i, '--provider'); i++; }
     else if (a === '--reasoning-effort') { reasoningEffort = nextValue(args, i, '--reasoning-effort'); i++; }
+    else if (a === '--job-id') { jobId = nextValue(args, i, '--job-id'); i++; }
+    else if (a === '--task-file') { taskFile = nextValue(args, i, '--task-file'); i++; }
+    else if (a.startsWith('-')) { throw new Error(`unknown option: ${a}`); }
     else { taskParts.push(a); }
   }
-  const task = taskParts.join(' ').trim();
+  if (taskFile && taskParts.length) throw new Error('use either task text or --task-file, not both');
+  const task = taskFile ? await readTaskFile(taskFile) : taskParts.join(' ').trim();
   if (!task) throw new Error('usage: dsh-rpc run <task…> [--workspace <path>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>]');
-  if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  checkPermissionAck(permission, allowDangerFullAccess);
   const modelSel = buildModelSelection(model, modelProvider, reasoningEffort);
 
   const absPath = resolvePath(workspacePath);
-  const workspace = await ensureWorkspace(absPath);
+  const workspace = await requireWorkspace(absPath, requireTitle, createWorkspace);
 
   const created = await rpc('session.create', { workspaceId: workspace.workspaceId });
   const sessionId = created.sessionId;
   if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
 
   try {
-    await runSession({ sessionId, task, wait, quiet, permission, timeoutMs, model: modelSel, onIdle: () => console.log(sessionId) });
+    const result = await runSession({ sessionId, task, wait, quiet, permission, timeoutMs, pollMs, model: modelSel, jobId });
+    const output = { ...result, workspace: workspace.title };
+    printResult(output, json, wait ? (result.assistantText || `(no assistant text captured — use \`dsh-rpc history ${sessionId}\`)`) : sessionId);
+    if (result.outcome === 'BLOCKED') process.exitCode = 3;
+    if (result.outcome === 'NEEDS_INPUT') process.exitCode = 4;
   } catch (e) {
     // this is a fresh session we created — cancel it so a failed run doesn't leave it running
     await cancelSession(sessionId).catch(() => {});
@@ -461,33 +564,46 @@ async function cmdRun(args) {
 async function cmdPrompt(args) {
   let wait = false;
   let quiet = false;
-  let permission = null;
+  let json = false;
+  let permission = 'read-only';
   let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
+  let pollMs = POLL_MS;
   let model = null;
   let modelProvider = null;
   let reasoningEffort = null;
+  let jobId;
   const rest = [];
+  let literal = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--wait') { wait = true; }
+    if (literal) { rest.push(a); continue; }
+    if (a === '--') { literal = true; }
+    else if (a === '--wait') { wait = true; }
     else if (a === '--permission' || a === '-p') { permission = nextValue(args, i, '--permission'); i++; }
     else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
+    else if (a === '--json') { json = true; }
     else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
+    else if (a === '--poll-ms') { pollMs = Number(nextValue(args, i, '--poll-ms')); if (!Number.isFinite(pollMs) || pollMs <= 0) throw new Error('--poll-ms must be a positive number'); i++; }
     else if (a === '--model') { model = nextValue(args, i, '--model'); i++; }
     else if (a === '--provider') { modelProvider = nextValue(args, i, '--provider'); i++; }
     else if (a === '--reasoning-effort') { reasoningEffort = nextValue(args, i, '--reasoning-effort'); i++; }
+    else if (a === '--job-id') { jobId = nextValue(args, i, '--job-id'); i++; }
+    else if (a.startsWith('-')) { throw new Error(`unknown option: ${a}`); }
     else { rest.push(a); }
   }
   const sessionId = rest[0];
   const text = rest.slice(1).join(' ').trim();
   if (!sessionId || !text) throw new Error('usage: dsh-rpc prompt <sessionId> [--wait] [--permission <mode>] [--model <model>] [--timeout <sec>] [--quiet] <text…>');
-  if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  checkPermissionAck(permission, allowDangerFullAccess);
   const modelSel = buildModelSelection(model, modelProvider, reasoningEffort);
   // runSession does NOT cancel this session on error — it may pre-exist and
   // belong to prior work, unlike the fresh session created by `run`.
-  await runSession({ sessionId, task: text, wait, quiet, permission, timeoutMs, model: modelSel, onIdle: () => console.log(`accepted session ${sessionId}`) });
+  const result = await runSession({ sessionId, task: text, wait, quiet, permission, timeoutMs, pollMs, model: modelSel, jobId });
+  printResult(result, json, wait ? (result.assistantText || `(no assistant text captured — use \`dsh-rpc history ${sessionId}\`)`) : `accepted session ${sessionId}`);
+  if (result.outcome === 'BLOCKED') process.exitCode = 3;
+  if (result.outcome === 'NEEDS_INPUT') process.exitCode = 4;
 }
 
 // CLI-level acknowledgement guard (no server call): the full-access preset is
@@ -509,30 +625,40 @@ async function cmdFork(args) {
   let atSeq;
   let wait = true;
   let quiet = false;
-  let permission = null;
+  let json = false;
+  let permission = 'read-only';
   let allowDangerFullAccess = false;
   let timeoutMs = 10 * 60 * 1000;
+  let pollMs = POLL_MS;
   let model = null;
   let modelProvider = null;
   let reasoningEffort = null;
+  let jobId;
   const rest = [];
+  let literal = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--at-seq') { atSeq = Number(nextValue(args, i, '--at-seq')); if (!Number.isInteger(atSeq) || atSeq < 0) throw new Error('--at-seq must be a non-negative integer'); i++; }
+    if (literal) { rest.push(a); continue; }
+    if (a === '--') { literal = true; }
+    else if (a === '--at-seq') { atSeq = Number(nextValue(args, i, '--at-seq')); if (!Number.isInteger(atSeq) || atSeq < 0) throw new Error('--at-seq must be a non-negative integer'); i++; }
     else if (a === '--no-wait') { wait = false; }
     else if (a === '--quiet' || a === '-q') { quiet = true; }
+    else if (a === '--json') { json = true; }
     else if (a === '--permission' || a === '-p') { permission = nextValue(args, i, '--permission'); i++; }
     else if (a === '--allow-danger-full-access') { allowDangerFullAccess = true; }
     else if (a === '--timeout') { timeoutMs = parseTimeoutSeconds(nextValue(args, i, '--timeout'), '--timeout'); i++; }
+    else if (a === '--poll-ms') { pollMs = Number(nextValue(args, i, '--poll-ms')); if (!Number.isFinite(pollMs) || pollMs <= 0) throw new Error('--poll-ms must be a positive number'); i++; }
     else if (a === '--model') { model = nextValue(args, i, '--model'); i++; }
     else if (a === '--provider') { modelProvider = nextValue(args, i, '--provider'); i++; }
     else if (a === '--reasoning-effort') { reasoningEffort = nextValue(args, i, '--reasoning-effort'); i++; }
+    else if (a === '--job-id') { jobId = nextValue(args, i, '--job-id'); i++; }
+    else if (a.startsWith('-')) { throw new Error(`unknown option: ${a}`); }
     else { rest.push(a); }
   }
   const sessionId = rest[0];
   const text = rest.slice(1).join(' ').trim();
   if (!sessionId) throw new Error('usage: dsh-rpc fork <sessionId> [--at-seq <n>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>] [<text…>]');
-  if (permission) checkPermissionAck(permission, allowDangerFullAccess);
+  checkPermissionAck(permission, allowDangerFullAccess);
   const modelSel = buildModelSelection(model, modelProvider, reasoningEffort);
 
   const payload = { sessionId };
@@ -541,10 +667,13 @@ async function cmdFork(args) {
   const childId = child.sessionId;
   if (!quiet) console.error(`forked ${sessionId} -> ${childId}`);
 
-  if (!text) { console.log(childId); return; }
+  if (!text) { printResult({ sessionId: childId, parentSessionId: sessionId }, json, childId); return; }
 
   try {
-    await runSession({ sessionId: childId, task: text, wait, quiet, permission, timeoutMs, model: modelSel, onIdle: () => console.log(childId) });
+    const result = await runSession({ sessionId: childId, task: text, wait, quiet, permission, timeoutMs, pollMs, model: modelSel, jobId });
+    printResult({ ...result, parentSessionId: sessionId }, json, wait ? (result.assistantText || `(no assistant text captured — use \`dsh-rpc history ${childId}\`)`) : childId);
+    if (result.outcome === 'BLOCKED') process.exitCode = 3;
+    if (result.outcome === 'NEEDS_INPUT') process.exitCode = 4;
   } catch (e) {
     // the child is a session we just created — cancel it so a failed run doesn't leave it running
     await cancelSession(childId).catch(() => {});
@@ -563,10 +692,53 @@ async function cmdSearch(args) {
   if (res.hasMore) console.error('(more results available)');
 }
 
-async function cmdHistory(args) {
+async function sessionSummary(sessionId) {
+  const list = await rpc('session.list', {});
+  return (list.items || []).find((item) => item.sessionId === sessionId);
+}
+
+async function cmdStatus(args) {
   const sessionId = args[0];
-  if (!sessionId) throw new Error('usage: dsh-rpc history <sessionId>');
+  if (!sessionId) throw new Error('usage: dsh-rpc status <sessionId> [--job-id <id>]');
+  let jobId;
+  for (let index = 1; index < args.length; index++) {
+    if (args[index] === '--job-id') { jobId = nextValue(args, index, '--job-id'); index++; }
+    else throw new Error(`unknown status option: ${args[index]}`);
+  }
+  const [summary, history] = await Promise.all([sessionSummary(sessionId), getHistory(sessionId)]);
+  if (!summary) throw new Error(`unknown session: ${sessionId}`);
+  const turnEnd = latestTurnEnd(history);
+  const assistantText = finalAssistantText(history);
+  console.log(JSON.stringify({
+    sessionId,
+    running: summary.running,
+    permission: currentPermission(history),
+    pendingApproval: pendingApproval(history) || null,
+    turnEndReason: turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : null,
+    outcome: markerOutcome(assistantText, jobId) || null,
+    assistantText,
+  }, null, 2));
+}
+
+async function cmdCancel(args) {
+  const sessionId = args[0];
+  if (!sessionId || args.length !== 1) throw new Error('usage: dsh-rpc cancel <sessionId>');
+  await cancelSession(sessionId);
+  console.log(`cancelled ${sessionId}`);
+}
+
+async function cmdHistory(args) {
+  let json = false;
+  const rest = [];
+  for (const arg of args) {
+    if (arg === '--json') json = true;
+    else if (arg.startsWith('-')) throw new Error(`unknown history option: ${arg}`);
+    else rest.push(arg);
+  }
+  const sessionId = rest[0];
+  if (!sessionId || rest.length !== 1) throw new Error('usage: dsh-rpc history <sessionId> [--json]');
   const history = await getHistory(sessionId);
+  if (json) { console.log(JSON.stringify(history, null, 2)); return; }
   for (const entry of history.events || []) {
     const ev = entry.event || entry;
     if (ev.type === 'user/message' && ev.data && ev.data.message) {
@@ -581,9 +753,19 @@ async function cmdHistory(args) {
 }
 
 async function cmdCall(args) {
-  const method = args[0];
-  const payloadJson = args.slice(1).join(' ');
-  if (!method) throw new Error('usage: dsh-rpc call <method> [json-payload]');
+  let allowUnsafeCall = false;
+  const rest = [];
+  for (const arg of args) {
+    if (arg === '--allow-unsafe-call') allowUnsafeCall = true;
+    else rest.push(arg);
+  }
+  const method = rest[0];
+  const payloadJson = rest.slice(1).join(' ');
+  if (!method) throw new Error('usage: dsh-rpc call [--allow-unsafe-call] <method> [json-payload]');
+  const readOnlyMethods = new Set(['workspace.list', 'session.list', 'session.history', 'session.search', 'session.models']);
+  if (!readOnlyMethods.has(method) && !allowUnsafeCall) {
+    throw new Error(`raw RPC method ${JSON.stringify(method)} may mutate state; pass --allow-unsafe-call to acknowledge`);
+  }
   let payload = {};
   if (payloadJson) {
     try { payload = JSON.parse(payloadJson); }
@@ -593,51 +775,61 @@ async function cmdCall(args) {
   console.log(JSON.stringify(value, null, 2));
 }
 
-const HELP = `dsh-rpc — drive DeepSeek Harness (dsh) via its local /api RPC endpoint.
+const VERSION = `dsh-rpc ${BUILD_ID}\nsource: ${SOURCE_URL}`;
+
+const HELP = `dsh-rpc — guarded DeepSeek Harness RPC automation with grouped sessions.
 
 Usage:
-  dsh-rpc workspaces                       list workspaces
-  dsh-rpc sessions                         list sessions
+  dsh-rpc workspaces [--table]             list workspaces (JSON by default)
+  dsh-rpc sessions [--table]               list sessions (JSON by default)
   dsh-rpc run <task…> [opts]               create a grouped session, send task, wait, print result
-       --workspace,-w <path>               target workspace dir (default: cwd)
-       --permission,-p <mode>              set+verify session permission before the task
-                                           (preset must be offered by the deployment; e.g. read-only)
+       --workspace,-w <path>               exact registered workspace (default: cwd)
+       --require-title <title>              also require the registered workspace title
+       --create-workspace                   explicitly allow creating a missing workspace
+       --permission,-p <mode>              set+verify permission (default: read-only)
        --allow-danger-full-access          required acknowledgement for danger-full-access
        --model <model>                     select the model: a bare id, or <provider>/<model>
        --provider <name>                   disambiguate --model across providers (optional)
        --reasoning-effort <id>             reasoning effort for --model (optional)
+       --task-file <path>                  read multiline task text from a file
+       --job-id <id>                       require a matching DEEPSEEK_* terminal marker
        --no-wait                           return the session id immediately
        --timeout <sec>                     max wait, then cancel (default 600)
+       --poll-ms <milliseconds>            completion polling interval
+       --json                              emit structured result evidence
        --quiet,-q                          suppress progress
   dsh-rpc prompt <sessionId> <text…>       send a prompt to an existing session
-       --wait [--permission <mode>] [--model <model>] [--timeout <sec>] [--quiet]
+       --wait [--permission <mode>] [--model <model>] [--job-id <id>] [--json]
   dsh-rpc fork <sessionId> [<text…>]       branch an existing session (child keeps workspace grouping)
-       [--at-seq <n>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>]
+       [--at-seq <n>] [--permission <mode>] [--model <model>] [--job-id <id>] [--json]
   dsh-rpc search <query>                   search the deployment's session history
-  dsh-rpc history <sessionId>              print a session's messages
-  dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session.list '{}')
+  dsh-rpc status <sessionId> [--job-id]    print guarded status evidence as JSON
+  dsh-rpc cancel <sessionId>               explicitly cancel a session
+  dsh-rpc history <sessionId> [--json]     print a session's messages
+  dsh-rpc call <method> [json]             read-only raw RPC methods
+       --allow-unsafe-call                 acknowledge a potentially mutating raw RPC
 
-Env: DSH_URL (default http://127.0.0.1:3080), DSH_POLL_MS (default 1000)
+Env: DSH_URL, DSH_POLL_MS, DSH_RPC_TIMEOUT_MS
 
-Grouped-session guarantee: sessions are created through the same /api path the
-web UI uses, so they appear under their workspace (not as "ungrouped").
-
-Safety behavior: with --permission the preset is applied via commands/execute and
-verified before the task is submitted; completion requires a turn/end with reason
-"completed"; a pending approval, a timeout, or Ctrl-C cancels the session instead
-of leaving it running.`;
+Safety defaults: read-only permission, exact pre-registered workspace, strict RPC
+envelope and task-admission checks, permission-drift detection, a new completed
+turn/end event, optional terminal marker evidence, and cancellation on approval,
+timeout, or Ctrl-C.`;
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
-    case 'workspaces': return cmdWorkspaces();
-    case 'sessions': return cmdSessions();
+    case 'workspaces': return cmdWorkspaces(rest);
+    case 'sessions': return cmdSessions(rest);
     case 'run': return cmdRun(rest);
     case 'prompt': return cmdPrompt(rest);
     case 'fork': return cmdFork(rest);
     case 'search': return cmdSearch(rest);
+    case 'status': return cmdStatus(rest);
+    case 'cancel': return cmdCancel(rest);
     case 'history': return cmdHistory(rest);
     case 'call': return cmdCall(rest);
+    case 'version': case '--version': case '-V': console.log(VERSION); return;
     case 'help': case '--help': case '-h': case undefined:
       console.log(HELP); return;
     default:

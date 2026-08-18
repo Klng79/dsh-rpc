@@ -1,7 +1,7 @@
 {
   "name": "dsh-rpc",
-  "version": "0.1.0",
-  "description": "Drive DeepSeek Harness (dsh) programmatically via its local /api RPC bridge - with grouped sessions.",
+  "version": "0.2.0",
+  "description": "Guarded DeepSeek Harness RPC automation with grouped sessions and fail-closed defaults.",
   "license": "MIT",
   "bin": { "dsh-rpc": "dsh-rpc" },
   "scripts": { "test": "node --test" },
