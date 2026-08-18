@@ -67,18 +67,30 @@ dsh-rpc run <task…> [opts]              create a grouped session, send task, w
       --reasoning-effort <id>           reasoning effort for --model (optional)
       --no-wait                         return the session id immediately
       --timeout <sec>                   max wait, then cancel (default 600)
+      --task-file <path>                read the task text from a file (mutually exclusive with positional text)
+      --job-id <id>                     require a terminal marker DEEPSEEK_DONE/BLOCKED/NEEDS_INPUT:<id>
+      --json                            emit structured JSON evidence instead of plain text
+      --poll-ms <ms>                    override the completion polling interval
+      --create-workspace                create the workspace if missing (default: fail if missing)
+      --require-title <title>           require the registered workspace title to match
+      --                                treat every following token as literal task text
       --quiet,-q                        suppress progress
 dsh-rpc prompt <sessionId> [opts] <text…>  send a follow-up to an existing session
       --wait                            wait for completion and print the result
       --permission,-p <mode>            (optional) change the permission first
       --model <model>                   (optional) switch the model first
       --timeout <sec>                   max wait, then cancel (default 600)
+      --task-file --job-id <id> --json --poll-ms <ms>
 dsh-rpc fork <sessionId> [<text…>] [opts]  branch an existing session (child keeps workspace grouping)
       --at-seq <n>                      cut the branch at a specific history seq (optional)
       --no-wait --permission,-p <mode> --model <model> --timeout <sec> --quiet
+      --task-file --job-id <id> --json --poll-ms <ms>
 dsh-rpc search <query>                  search the deployment's session history
+dsh-rpc status <sessionId>              print structured JSON evidence about a session
+dsh-rpc cancel <sessionId>              explicitly cancel a session
 dsh-rpc history <sessionId>             print a session's messages
 dsh-rpc call <method> [json]            raw RPC escape hatch
+dsh-rpc version|--version|-V            print the version and repository
 ```
 
 ### Examples
@@ -164,6 +176,9 @@ Notes:
   progress and diagnostics go to **stderr**.
 - Exit code `0` on success, `1` on error, `2` on an unknown command,
   `130` when interrupted with Ctrl-C (which cancels the active session).
+- With `--job-id`, a `DEEPSEEK_BLOCKED:<id>` marker exits `3` and a
+  `DEEPSEEK_NEEDS_INPUT:<id>` marker exits `4` (both still print the result);
+  a `DEEPSEEK_DONE:<id>` marker exits `0`. A missing terminal marker is an error.
 
 ## Testing
 
@@ -217,6 +232,13 @@ These opt-in guards harden unattended runs. They are additive — the default
   (`/permission <mode>`) and **verified** against the session's `permissions`
   projection before the task is submitted. `danger-full-access` additionally
   requires `--allow-danger-full-access`.
+- **Permission-drift detection.** While waiting, if the session's permission
+  changes away from the one you requested (with `--permission`), the session is
+  cancelled and the run fails. When `--permission` is omitted no permission is
+  forced or checked.
+- **Checkpointed completion.** The history is snapshotted right before the
+  prompt; a stale `turn/end` or answer from an earlier prompt is never reused as
+  this submission's result.
 - **Stronger completion gate.** On finish, the latest `turn/end` event is
   checked; a terminal reason other than `completed` is surfaced as an error.
 - **Approval detection.** If the session raises an unresolved approval request
@@ -254,9 +276,9 @@ These opt-in guards harden unattended runs. They are additive — the default
 ## Credits
 
 The permission-via-`commands/execute` technique, the `turn/end: completed`
-completion gate, and the approval/timeout-cancel behavior were adapted from
-[jnsys](https://github.com/jnsys)'s guarded-runner proposal
-([issue #1 / PR #2](https://github.com/Klng79/dsh-rpc/pull/2)). Thanks, jnsys!
+completion gate, and the approval/timeout-cancel behavior were adapted from a
+contributed "guarded runner" proposal
+([issue #1 / PR #2](https://github.com/Klng79/dsh-rpc/pull/2)). Thanks!
 
 ## Verified against
 
