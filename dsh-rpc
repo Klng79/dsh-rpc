@@ -316,8 +316,10 @@ async function applyAndVerifyPermission(sessionId, permission) {
   if (names.length && !names.includes(permission)) {
     throw new Error(`permission "${permission}" is not offered by this deployment; available: ${names.join(', ')}`);
   }
+  // `commands/execute` on dsh >= 0.1.1-rc.2 requires an `images` arg (array of
+  // { mediaType, data, name? }); send an empty array since we never attach media.
   const exec = await rpc('commands/execute', {
-    args: { agentId: sessionId, line: `/permission ${permission}` },
+    args: { agentId: sessionId, line: `/permission ${permission}`, images: [] },
   });
   if (!exec || !exec.result || exec.result.kind !== 'success') {
     const detail = exec && exec.result && exec.result.text ? `: ${exec.result.text}` : '';

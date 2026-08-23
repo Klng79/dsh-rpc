@@ -251,6 +251,38 @@ test('run: --permission validates against deployment presets (custom preset work
   }
 });
 
+test('run: --permission sends images:[] to commands/execute (dsh >= 0.1.1-rc.2 requires the arg)', async () => {
+  const options = [{ name: 'read-only' }];
+  let imagesArg = null;
+  let prompted = false;
+  const history = (withEvents) => ({
+    events: withEvents ? [
+      { event: { type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+      { event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done' }] } } } },
+    ] : [],
+    projections: { values: { permissions: { options, currentValue: 'read-only' } } },
+  });
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', ['sess-1'])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'commands/execute': { imagesArg = r.payload && r.payload.args && r.payload.args.images; return ok({ result: { kind: 'success' } }); }
+      case 'session.prompt': prompted = true; return ok(null);
+      case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      case 'session.history': return ok(history(prompted));
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'do it', '--permission', 'read-only', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.ok(Array.isArray(imagesArg), 'commands/execute must receive an images array');
+    assert.strictEqual(imagesArg.length, 0, 'dsh-rpc never attaches media, so images must be empty');
+  } finally {
+    server.close();
+  }
+});
+
 test('run: --permission not offered by the deployment is rejected (fresh session cancelled)', async () => {
   const calls = [];
   let executed = false;
