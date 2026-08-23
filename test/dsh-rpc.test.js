@@ -214,6 +214,33 @@ test('run: a non-completed turn/end reason surfaces as an error', async () => {
     server.close();
   }
 });
+test('run: a non-completed "error" turn/end surfaces the underlying error message', async () => {
+  let listCalls = 0;
+  let prompted = false;
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', ['sess-1'])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'session.prompt': prompted = true; return ok(null);
+      case 'session.list': { listCalls++; return ok({ items: [{ sessionId: 'sess-1', running: listCalls < 2 }] }); }
+      case 'session.history': {
+        if (!prompted) return ok({ events: [], projections: { values: {} } });
+        return ok({ events: [{
+          event: { type: 'turn/end', data: { reason: { kind: 'error', error: { message: 'Authentication Fails, api key invalid', code: 'AUTH', status: 401 } } } },
+        }], projections: { values: {} } });
+      }
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'do it', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /not completed/);
+    assert.match(res.err, /Authentication Fails, api key invalid/);
+  } finally {
+    server.close();
+  }
+});
 test('run: --permission validates against deployment presets (custom preset works)', async () => {
   let listCalls = 0;
   let appliedPermission = null;

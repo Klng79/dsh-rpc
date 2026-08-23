@@ -433,7 +433,11 @@ async function waitForCompletion(sessionId, timeoutMs, quiet, checkpoint, reques
       const turnEnd = history ? latestTurnEnd(history, checkpoint) : undefined;
       const kind = turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : undefined;
       if (kind && kind !== 'completed') {
-        throw new Error(`session ended with reason "${kind}" (not completed)`);
+        // Surface the underlying terminal error (e.g. a provider auth failure)
+        // instead of stopping at an opaque "reason error".
+        const err = turnEnd && turnEnd.data && turnEnd.data.reason && turnEnd.data.reason.error;
+        const detail = err && err.message ? `: ${err.message}` : '';
+        throw new Error(`session ended with reason "${kind}" (not completed)${detail}`);
       }
       return;
     }

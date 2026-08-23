@@ -282,11 +282,12 @@ contributed "guarded runner" proposal
 
 ## Verified against
 
-- `@deepseek-ai/dsh` v0.1.0-rc.7
+- `@deepseek-ai/dsh` v0.1.1-rc.2
 
-`dsh-rpc` targets the `/api` RPC surface used by the web UI. In rc.7 that
-surface is unchanged from rc.6 for every method this tool calls, so the two
-versions are interchangeable here.
+dsh-rpc targets the `/api` RPC surface used by the web UI. In 0.1.1-rc.2, the
+core session/workspace flow is unchanged from rc.6/rc.7. One compat note: rc.2
+made `commands/execute` require an `images` argument, so `--permission` sends
+`images: []` (dsh-rpc never attaches media).
 
 ## License
 
