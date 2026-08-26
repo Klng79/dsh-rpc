@@ -439,7 +439,15 @@ async function waitForCompletion(sessionId, timeoutMs, quiet, checkpoint, reques
         const detail = err && err.message ? `: ${err.message}` : '';
         throw new Error(`session ended with reason "${kind}" (not completed)${detail}`);
       }
-      return;
+      // Only treat the run as complete with positive evidence: the session was
+      // observed running (`sawRunning`) or a terminal `turn/end` with reason
+      // "completed" appeared after the checkpoint. A session that never reported
+      // running and produced no completion must NOT be reported done — a turn
+      // that is slow to start would otherwise be falsely completed once the 3s
+      // grace elapses (it keeps polling and cancels on timeout instead).
+      if (sawRunning || kind === 'completed') {
+        return;
+      }
     }
     if (!quiet) {
       const secs = Math.round((Date.now() - start) / 1000);
@@ -606,7 +614,7 @@ async function cmdWorkspaces() {
   const items = await listWorkspaces();
   if (!items.length) { console.log('(no workspaces)'); return; }
   for (const w of items) {
-    console.log(`${w.workspaceId}  ${w.title}  [${w.sessionIds.length} sessions]  ${w.path}`);
+    console.log(`${w.workspaceId}  ${w.title}  [${(w.sessionIds || []).length} sessions]  ${w.path}`);
   }
 }
 
@@ -736,7 +744,7 @@ async function cmdSearch(args) {
   const query = args.join(' ').trim();
   if (!query) throw new Error('usage: dsh-rpc search <query>');
   const res = await rpc('session.search', { query });
-  const items = res.items || [];
+  const items = (res && res.items) || [];
   if (!items.length) { console.log('(no matches)'); return; }
   for (const it of items) console.log(`${it.sessionId}\t${it.snippet}`);
   if (res.hasMore) console.error('(more results available)');
@@ -746,7 +754,7 @@ async function cmdHistory(args) {
   const sessionId = args[0];
   if (!sessionId) throw new Error('usage: dsh-rpc history <sessionId>');
   const history = await getHistory(sessionId);
-  for (const entry of history.events || []) {
+  for (const entry of (history && history.events) || []) {
     const ev = entry.event || entry;
     if (ev.type === 'user/message' && ev.data && ev.data.message) {
       console.log(`\n=== user ===\n${textOf(ev.data.message)}`);

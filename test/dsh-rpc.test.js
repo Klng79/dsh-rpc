@@ -917,5 +917,55 @@ test('run: -- emits literal task text and --json emits structured evidence', asy
   }
 });
 
+test('run: a session that never reports running and produces no completion is not falsely completed', async () => {
+  const calls = [];
+  let prompted = false;
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      case 'workspace.list': return ok({ items: [WS('ws1', 'T', ['sess-1'])] });
+      case 'session.create': return ok({ sessionId: 'sess-1' });
+      case 'session.prompt': prompted = true; return ok(null);
+      // the session is never observed running and history never gets a turn/end
+      case 'session.list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      case 'session.history': return ok({ events: [], projections: { values: {} } });
+      case 'session.cancel': return ok(null);
+      default: return ok(null);
+    }
+  });
+  try {
+    const res = await runCli(['run', 'do it', '--timeout', '2'], { DSH_URL: `http://127.0.0.1:${port}` });
+    // Must NOT exit 0 as "completed" just because the 3s grace elapsed while idle.
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /timed out/);
+    assert.ok(calls.includes('session.cancel'), 'idle/no-completion session should be cancelled, not reported done');
+  } finally {
+    server.close();
+  }
+});
 
+test('workspaces: a workspace object without sessionIds is rendered defensively', async () => {
+  const { server, port } = await startMock((r) => {
+    if (r.method === 'workspace.list') return ok({ items: [{ workspaceId: 'ws1', title: 'T', path: '/x' }] });
+    return ok(null);
+  });
+  try {
+    const res = await runCli(['workspaces'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.match(res.out, /\[0 sessions\]/);
+  } finally {
+    server.close();
+  }
+});
+
+test('search: a null result value is handled instead of crashing', async () => {
+  const { server, port } = await startMock((r) => ok(null));
+  try {
+    const res = await runCli(['search', 'foo'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.match(res.out, /no matches/);
+  } finally {
+    server.close();
+  }
+});
 
