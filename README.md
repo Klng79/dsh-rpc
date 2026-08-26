@@ -135,6 +135,18 @@ dsh-rpc history session-xxxx
 dsh-rpc call workspace.list '{}'
 ```
 
+### Agent example: bounded topic-aware continuation
+
+Agents do not have to create a fresh session for every closely related
+follow-up. The optional
+[topic-aware session routing skill](examples/topic-aware-session-routing/SKILL.md)
+shows how an orchestrator can capture a `jobId` → `sessionId` ledger and choose
+between `prompt`, `fork`, and `run` without changing this CLI's defaults.
+
+The example fails closed to `run` when a topic match is ambiguous and bounds
+reuse to six admitted prompts or 24 hours, whichever comes first. This keeps
+short follow-ups efficient without encouraging unbounded history growth.
+
 ## Configuration
 
 | Env var | Default | Meaning |
