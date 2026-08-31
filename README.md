@@ -8,10 +8,10 @@ RPC bridge that dsh's own web UI uses. That means the sessions it creates are
 attached to a workspace exactly like ones created in the browser — unlike
 `dsh --profile headless`, whose sessions always show up **ungrouped**.
 
-- **No browser, no Screen Recording.** Pure HTTP to a loopback server.
+- **No browser, no Screen Recording.** Pure HTTP + WebSocket to a loopback server.
 - **Grouped sessions.** Created through the same `/api` path as the web UI.
 - **Multi-turn.** Keep prompting the same session.
-- **Zero dependencies.** Plain Node (18+), uses only global `fetch`/`crypto`.
+- **Zero dependencies.** Plain Node (22+), uses only global `fetch`/`crypto`/`WebSocket`.
 
 ## Why
 
@@ -24,18 +24,22 @@ grouped":
 | `--profile headless` | ❌ | ✅ | one-shot, always "ungrouped" |
 | **`dsh-rpc`** | ✅ | ✅ | this tool |
 
-dsh's web UI is a React client over a local HTTP RPC bridge plus two WebSocket
-downlinks. `dsh-rpc` speaks that same bridge, so it gets the web UI's grouping
+dsh's web UI is a React client over a local HTTP RPC bridge plus a WebSocket
+mux. `dsh-rpc` speaks that same bridge, so it gets the web UI's grouping
 behavior without needing a browser or any screen-capture permission.
 
 ## Requirements
 
-- **Node.js 18+** (uses global `fetch`; tested on Node 24).
+- **Node.js 22+** (uses the built-in `WebSocket` client for `/api/remote.mux`; tested on Node 24).
 - A **running dsh web server**. Start it with:
   ```sh
-  npm exec @deepseek-ai/dsh web
+  dsh web          # or: npm exec @deepseek-ai/dsh web
   ```
   (default `http://127.0.0.1:3080`).
+- A **browser-auth credential**. The 0.1.2+ server signs every request; dsh-rpc
+  reads the persisted signing secret from `~/.dsh/.credentials.yaml` (record
+  `client-connection/browser-session`, written by the first `dsh web` run) or
+  from `DSH_AUTH_SECRET` (base64url).
 
 ## Install
 
@@ -58,8 +62,10 @@ npm test          # runs the dependency-free node:test suite against a mock serv
 dsh-rpc workspaces                      list workspaces
 dsh-rpc sessions                        list sessions
 dsh-rpc run <task…> [opts]              create a grouped session, send task, wait, print result
-      --workspace,-w <path>             target workspace dir (default: cwd)
-      --permission,-p <mode>            set+verify the session permission before the task:
+      --workspace,-w <path>             target workspace dir (default: cwd; matched by real path,
+                                        so symlinked spellings of the project folder resolve)
+      --permission,-p <mode>            set+verify the session permission before the task
+                                        (default: workspace-write for task runs)
                                         read-only | workspace-write | danger-full-access
       --allow-danger-full-access        required acknowledgement for danger-full-access
       --model <model>                   select the model: a bare id, or <provider>/<model>
@@ -132,7 +138,7 @@ dsh-rpc sessions
 dsh-rpc history session-xxxx
 
 # Raw RPC
-dsh-rpc call workspace.list '{}'
+dsh-rpc call session/list '{"_request":{}}'
 ```
 
 ## Configuration
@@ -140,6 +146,7 @@ dsh-rpc call workspace.list '{}'
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `DSH_URL` | `http://127.0.0.1:3080` | dsh web server base URL |
+| `DSH_AUTH_SECRET` | *(from `~/.dsh/.credentials.yaml`)* | browser-session signing secret (base64url), see Requirements |
 | `DSH_POLL_MS` | `1000` | completion poll period (ms) |
 | `DSH_RPC_TIMEOUT_MS` | `30000` | per-request timeout for the `/api` bridge (ms) |
 
@@ -157,18 +164,19 @@ a typical set:
 
 Notes:
 
-- dsh assigns its **own default preset to new sessions** (on the deployment this
-  was built against, the default is `danger-full-access`). Pass `--permission`
-  to override it for a run.
+- **`workspace-write` is the default for task runs.** `run`, `prompt`, and
+  `fork <text>` apply + verify `workspace-write` unless `--permission`
+  overrides it. This pins unattended task execution below dsh's own default
+  for new sessions (on this deployment, `danger-full-access`).
 - The requested preset is **validated against the deployment's**
   `permissions.options` before it is applied, so a preset the deployment doesn't
   define is rejected up front (instead of relying on a hardcoded list).
 - The chosen preset is applied via `commands/execute` and **verified** against
   the session's `permissions` projection before the task is submitted; a
   mismatch aborts the run.
-- To see the presets a deployment actually offers:
-  `dsh-rpc call session.history '{"sessionId":"<id>"}'` and read
-  `projections.values.permissions.options`.
+- To see the presets a deployment actually offers: attempt a run with any
+  `--permission` value — the "not offered" rejection lists the exact names this
+  deployment defines (read from the session's `permissions` projection).
 
 ## Output & exit codes
 
@@ -183,44 +191,65 @@ Notes:
 ## Testing
 
 `npm test` runs a dependency-free `node:test` suite (`test/dsh-rpc.test.js`)
-that spawns the CLI against an in-process mock of the `/api` bridge — no real
-dsh server needed. It covers the RPC envelope, trailing-slash `DSH_URL`,
-`--timeout`/missing-value validation, completion detection, the approval →
-cancel path, the non-completed terminal-reason gate, deployment-aware
-`--permission` validation, the shared `run`/`prompt` completion path, `fork`,
-`search`, and `--model` resolution (bare id, ambiguity, and `--provider`
-validation).
+that spawns the CLI against an in-process mock of the `/api` bridge — HTTP RPC
+plus a minimal RFC6455 server for the `/api/remote.mux` mux — with no real dsh
+server needed. The mock enforces browser-auth the way the real server does, so
+the suite covers cookie minting/verification, the RPC envelope, trailing-slash
+`DSH_URL`, `--timeout`/missing-value validation, completion detection, the
+approval → cancel path, the non-completed terminal-reason gate,
+deployment-aware `--permission` validation, the shared `run`/`prompt`
+completion path, `fork`, `search`, `--model` resolution (bare id, ambiguity,
+and `--provider` validation), and auth-failure guidance.
 
 ## How it works
 
-dsh exposes a single RPC route. Each method is an HTTP POST to
-`/api/<method>` with `Content-Type: application/json`:
+dsh (source build `dsh-v0.1.2-alpha.2` and later) exposes one unary RPC route
+plus one WebSocket stream mux. Unary methods are HTTP POSTs to
+`/api/<namespace>/<method>` with `Content-Type: application/json`; the payload
+must carry exactly one `args` object whose keys match the server's generated
+parameter wire names (`request` for most verbs, `_request` for `session/list`,
+`agentId`/`line`/`images` for `commands/execute`):
 
 ```jsonc
 // request
-{ "type": "client-request", "rpcId": "<uuid>", "method": "<method>", "payload": { /* … */ } }
+{ "type": "client-request", "rpcId": "<uuid>", "method": "<ns>/<m>", "payload": { "args": { /* … */ } } }
 
 // response
 { "type": "server-response", "rpcId": "<uuid>",
   "result": { "ok": true, "value": /* … */ } | { "ok": false, "error": { "code": "…", "message": "…" } } }
 ```
 
-The server enforces a **browser-trust fence**: every request's `Host` must be a
-loopback authority (`127.0.0.1` / `localhost`) or a declared `--trusted-host`.
-Local calls pass automatically. There is no auth layer — the server is
-loopback-only by design.
+Stream-only state (workspace list/updates, session journals, projections) is
+served by `/api/remote.mux`, a WebSocket carrying JSON text frames: the client
+sends `{type:'open', streamId, endpoint, payload}` and the server answers
+`{type:'item', streamId, value}` frames followed by `end` (or `error`). dsh-rpc
+opens a stream per call and cancels it after the item it needs
+(`workspace/follow` baseline, `session/follow` snapshot), reusing one
+connection. Requires Node 22+ for the built-in WebSocket client.
 
-Methods used here: `workspace.list`, `workspace.create`, `workspace.delete`,
-`session.create` (passing `workspaceId` attaches/groups the session),
-`session.prompt`, `session.list` (carries the `running` flag),
-`session.history`, `session.fork` (branching), `session.search`,
-`session.models` + `session.selectModel` (`--model`),
-`session.cancel`, and `commands/execute` (permission presets).
+**Auth.** The server requires a signed browser-auth cookie named
+`dsh-auth-<b64url(sha256(authority))>` with value
+`v1.<b64url(JSON)>.<HMAC-SHA256>` over
+`{version:1, authority, issuedAt, expiresAt}`. dsh-rpc mints that cookie from
+the signing secret in `~/.dsh/.credentials.yaml` (record
+`client-connection/browser-session`) or `DSH_AUTH_SECRET`; a missing/invalid
+credential produces a clear error before anything reaches the server. The
+server additionally enforces the **browser-trust fence** (loopback or trusted
+host).
 
-**Completion detection** polls `session.list` for the session's `running` flag
-(the same signal the host broadcasts over the `/api/events.host` WebSocket),
-then reads the final assistant message via `session.history`. This keeps the
-tool dependency-free — no WebSocket client required.
+Methods used here: `workspace/create`, `workspace/delete`, `workspace/follow`
+(stream baseline; replaces the old `workspace.list`), `session/create` (passing
+`workspaceId` attaches/groups the session), `session/prompt` (client-minted
+`requestId`), `session/list` (carries the `running` flag), `session/follow`
+(stream journal snapshot + projections; replaces `session.history`),
+`session/fork` (branching), `session/search`, `session/modelCatalog` +
+`session/selectModel` (`--model`), `session/cancel`, and `commands/execute`
+(permission presets).
+
+**Completion detection** polls `session/list` for the session's `running`
+flag, then reads the final assistant message from the `session/follow` snapshot
+(which also carries the `permissions` projection used by the permission
+verify/drift guards).
 
 ## Safety features
 
@@ -252,9 +281,11 @@ These opt-in guards harden unattended runs. They are additive — the default
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| `cannot reach dsh at http://127.0.0.1:3080` | The dsh web server isn't running. Start it with `npm exec @deepseek-ai/dsh web`, or point `DSH_URL` at the right address. |
-| `permission "<mode>" is not offered by this deployment` | The preset isn't in this deployment's `permissions.options`. List the real names with `dsh-rpc call session.history '{"sessionId":"<id>"}'` and read `projections.values.permissions.options`. |
-| `could not set permission "<mode>"` | The `/permission` command was rejected. Presets are deployment config — inspect `projections.values.permissions.options` via `session.history`. |
+| `cannot reach dsh at http://127.0.0.1:3080` | The dsh web server isn't running. Start it with `dsh web` (or `npm exec @deepseek-ai/dsh web`), or point `DSH_URL` at the right address. |
+| `no dsh web credential available` | The signing secret wasn't found. Run `dsh web` once to create `~/.dsh/.credentials.yaml`, or set `DSH_AUTH_SECRET` (base64url). |
+| `not authenticated for <endpoint> (401)` | The secret doesn't match the server's (e.g. `~/dsh/.credentials.yaml` is stale after a server reinstall). Re-run `dsh web` to re-mint it, or set `DSH_AUTH_SECRET` to the server's current secret. |
+| `permission "<mode>" is not offered by this deployment` | The preset isn't in this deployment's `permissions.options`. Attempt a run with any `--permission` value — the rejection lists the exact preset names. |
+| `could not set permission "<mode>"` | The `/permission` command was rejected. Presets are deployment config — see the preset names via the same rejection message. |
 | `permission verification failed` | The `/permission` command was accepted but the projection didn't reach the expected value. Re-run, or inspect `dsh-rpc history <id>`. |
 | `session ended with reason "<x>" (not completed)` | The turn did not finish cleanly (e.g. it was cancelled or errored). See `dsh-rpc history <id>`. |
 | `requested approval …; cancelled` | The session hit an approval prompt while unattended; the guard cancelled it. Re-run with a wider preset if the action is expected. |
@@ -263,12 +294,17 @@ These opt-in guards harden unattended runs. They are additive — the default
 
 ## Limitations & gotchas
 
-- **Polling, not streaming.** Progress and completion are detected by polling
-  `session.list` / `session.history` every `DSH_POLL_MS`. There is no live token
-  stream (the WebSocket downlinks are intentionally not consumed).
-- **Workspace matching is by exact absolute path.** Symlinks are not collapsed,
-  so on macOS `/tmp/x` and `/private/tmp/x` are different paths. Running from
-  inside the target directory (the default `cwd`) avoids the mismatch.
+- **Polling for completion; streams for state.** Completion is detected by
+  polling `session.list` every `DSH_POLL_MS` and reading `session/follow`
+  snapshots; there is no live token stream (the mux journal is intentionally
+  consumed snapshot-by-snapshot).
+- **The old `(0.1.1-rc.2 and earlier) dot-method surface is no longer
+  supported.** dsh-rpc 0.3.0 targets the 0.1.2+ authed, namespaced surface
+  exclusively.
+- **Workspace matching resolves symlinks.** Both the target path and each
+  registered workspace path are realpath'd before comparison, so `/tmp/x`
+  finds the workspace registered as `/private/tmp/x` (macOS). Creation passes
+  the path you give; the server canonicalizes it.
 - **`run` always starts a fresh session.** Use `prompt <sessionId>` to continue
   an existing one, or `fork <sessionId>` to branch off it into a new session.
 - **A running dsh web server is required** for every command.
@@ -282,12 +318,14 @@ contributed "guarded runner" proposal
 
 ## Verified against
 
-- `@deepseek-ai/dsh` v0.1.1-rc.2
+- dsh source build `dsh-v0.1.2-alpha.2` (`~/Desktop/Developer/deepseek-harness`),
+  verified live 2026-08-31: browser-auth cookies, `/api/<ns>/<m>` routes with
+  `{args}` payloads, `commands/execute` with `images: []`, and the
+  `/api/remote.mux` stream surface (`workspace/follow` baseline,
+  `session/follow` snapshot with projections).
 
-dsh-rpc targets the `/api` RPC surface used by the web UI. In 0.1.1-rc.2, the
-core session/workspace flow is unchanged from rc.6/rc.7. One compat note: rc.2
-made `commands/execute` require an `images` argument, so `--permission` sends
-`images: []` (dsh-rpc never attaches media).
+Older note: on the 0.1.1-rc.2 release, `commands/execute` required an `images`
+argument (dsh-rpc sends `images: []` — it never attaches media).
 
 ## License
 
