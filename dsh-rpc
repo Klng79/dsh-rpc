@@ -4,21 +4,34 @@
 /*
  * dsh-rpc — drive the DeepSeek Harness (dsh) web-server /api RPC endpoint from the CLI.
  *
- * dsh's web UI is a React client over a local HTTP RPC bridge (`/api`) plus two
- * WebSocket downlinks. This tool talks to the same `/api` bridge directly, so
+ * dsh's web UI is a React client over a local HTTP RPC bridge (`/api`) plus a
+ * WebSocket mux. This tool talks to the same `/api` bridge directly, so
  * sessions it creates are GROUPED under a workspace exactly like ones created in
  * the web UI (unlike `dsh --profile headless`, which is always ungrouped).
  *
- * Transport (reverse-engineered from @deepseek-ai/dsh v0.1.0-rc.6):
- *   POST <BASE>/api/<method>
- *   Content-Type: application/json
- *   body: { "type":"client-request", "rpcId":<uuid>, "method":<method>, "payload":{...} }
+ * Transport (dsh source build dsh-v0.1.2-alpha.2; replaces the 0.1.1-rc.2 surface):
+ *   POST <BASE>/api/<namespace>/<method>       (dot methods are gone)
+ *   headers: content-type + browser-auth cookie
+ *   body: { "type":"client-request", "rpcId":<uuid>, "method":"<ns>/<m>",
+ *           "payload":{ "args":{…} } }   args keys must match the server's
+ *           generated parameter wire names: "request" for most verbs,
+ *           "_request" for session/list, "agentId"/"line"/"images" for
+ *           commands/execute.
  *   resp: { "type":"server-response", "rpcId":<uuid>,
  *           "result": { "ok":true, "value":... } | { "ok":false, "error":{code,message} } }
  *
- * The server enforces a browser-trust fence: the request Host must be a loopback
- * authority (127.0.0.1 / localhost) or a declared --trusted-host. Running locally,
- * plain fetch to 127.0.0.1 passes automatically. No auth layer exists (loopback only).
+ * Live state is stream-only and rides the /api/remote.mux WebSocket (JSON
+ * text frames; the client opens a logical stream and reads its first item):
+ *   workspace/follow -> { type:'baseline', value:{ items:[Workspace…] } }
+ *   session/follow   -> { type:'snapshot', records, projections, cursor, hasMore }
+ *
+ * Auth: every request (HTTP and mux) needs a signed browser-auth cookie named
+ * `dsh-auth-<b64url(sha256(authority))>` with value `v1.<body>.<sig>` — an
+ * HMAC-SHA256 over b64url JSON {version,authority,issuedAt,expiresAt}. The
+ * signing secret comes from DSH_AUTH_SECRET (base64url) or from
+ * ~/.dsh/.credentials.yaml record `client-connection/browser-session` — the
+ * same secret dsh persists for the web UI. Requires Node >= 22 for the
+ * built-in WebSocket client.
  *
  * Safety features: permission is set via the `commands/execute` RPC + verified
  * against the `permissions` projection; completion requires a `turn/end` with
@@ -26,8 +39,9 @@
  * of leaving it running.
  *
  * Environment:
- *   DSH_URL       server base url        (default http://127.0.0.1:3080)
- *   DSH_POLL_MS   completion poll period (default 1000)
+ *   DSH_URL         server base url     (default http://127.0.0.1:3080)
+ *   DSH_AUTH_SECRET browser-session signing secret, base64url (else ~/.dsh/.credentials.yaml)
+ *   DSH_POLL_MS     completion poll period (default 1000)
  *
  * This file is intentionally dependency-free and module-system agnostic
  * (no require/import, no top-level await) so it runs under either CJS or ESM.
@@ -41,9 +55,15 @@ const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
 // DSH_RPC_TIMEOUT_MS.
 const RPC_TIMEOUT_MS = Number(process.env.DSH_RPC_TIMEOUT_MS || 30000);
 
+// Permission applied to task-execution runs (run / prompt / fork <text>) when
+// the caller does not pass --permission. dsh's own default for new sessions is
+// wider (this deployment: danger-full-access), so unattended task runs are
+// pinned to workspace-write unless explicitly widened with --permission.
+const DEFAULT_PERMISSION = 'workspace-write';
+
 // Project identity for `version` / `--version` / `-V`.
 const NAME = 'dsh-rpc';
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const REPO = 'https://github.com/Klng79/dsh-rpc';
 
 function uuid() {
@@ -53,6 +73,203 @@ function uuid() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ---- browser-auth cookie + /api/remote.mux stream client ---- */
+
+// Loopback authority (host:port) of the /api bridge; the cookie name is bound
+// to it exactly as the dsh web UI binds its credentials.
+const AUTHORITY = new URL(BASE).host;
+let authSecretPromise = null;
+let wsCookiePromise = null;
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
+}
+
+function b64urlDecode(s) {
+  const padded = String(s).replaceAll('-', '+').replaceAll('_', '/');
+  return Buffer.from(padded + '='.repeat((4 - (padded.length % 4)) % 4), 'base64');
+}
+
+async function sha256B64Url(text) {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return b64url(new Uint8Array(digest));
+}
+
+async function hmacB64Url(secretBytes, message) {
+  const key = await globalThis.crypto.subtle.importKey(
+    'raw', secretBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const sig = await globalThis.crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return b64url(new Uint8Array(sig));
+}
+
+// Resolve the browser-session signing secret: DSH_AUTH_SECRET first, then
+// ~/.dsh/.credentials.yaml (record client-connection/browser-session.secret,
+// written by `dsh web`). Line-scoped parse on purpose — no YAML dependency
+// and no credential material read beyond the secret itself.
+async function resolveAuthSecret() {
+  if (authSecretPromise) return authSecretPromise;
+  authSecretPromise = (async () => {
+    const fromEnv = process.env.DSH_AUTH_SECRET;
+    if (fromEnv) {
+      const secret = b64urlDecode(fromEnv);
+      if (secret.byteLength !== 32) {
+        throw new Error('DSH_AUTH_SECRET must be a base64url-encoded 32-byte key');
+      }
+      return secret;
+    }
+    const file = `${process.env.HOME || ''}/.dsh/.credentials.yaml`;
+    let text;
+    try {
+      text = await readTextFile(file);
+    } catch (e) {
+      throw new Error(
+        `no dsh web credential available: run \`dsh web\` once to create ${file}, or set DSH_AUTH_SECRET (${e.message})`,
+      );
+    }
+    const lines = text.split(/\r?\n/u);
+    const keyLine = lines.findIndex((l) => l.trimEnd() === '  client-connection/browser-session:');
+    if (keyLine === -1) {
+      throw new Error(`${file} has no client-connection/browser-session record — run \`dsh web\` once, or set DSH_AUTH_SECRET`);
+    }
+    for (let i = keyLine + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.trim() === '') continue;
+      if (line.match(/^ */u)[0].length <= 2) break;
+      const m = /^ +secret: (\S+) *$/u.exec(line);
+      if (m) {
+        const secret = b64urlDecode(m[1]);
+        if (secret.byteLength !== 32) {
+          throw new Error(`${file} browser-session secret has an unexpected length`);
+        }
+        return secret;
+      }
+    }
+    throw new Error(`${file} browser-session record has no secret field — run \`dsh web\` once, or set DSH_AUTH_SECRET`);
+  })().catch((e) => { authSecretPromise = null; throw e; });
+  return authSecretPromise;
+}
+
+// Cookie value: v1.<b64url(JSON)>.<b64url(HMAC-SHA256(json, secret))>, named
+// dsh-auth-<b64url(sha256(authority))> — the same shape the web UI mints
+// (dsh packages/client/connection/src/browser-auth.ts).
+async function wsCookie() {
+  if (wsCookiePromise) return wsCookiePromise;
+  wsCookiePromise = (async () => {
+    const secret = await resolveAuthSecret();
+    const issuedAt = Date.now() - 1000;
+    const expiresAt = issuedAt + 60 * 60 * 1000;
+    const body = b64url(new TextEncoder().encode(JSON.stringify({
+      version: 1, authority: AUTHORITY, issuedAt, expiresAt,
+    })));
+    const sig = await hmacB64Url(secret, body);
+    const name = `dsh-auth-${await sha256B64Url(AUTHORITY)}`;
+    return `${name}=v1.${body}.${sig}`;
+  })().catch((e) => { wsCookiePromise = null; throw e; });
+  return wsCookiePromise;
+}
+
+// The mux carries the stream-only Remote methods as JSON text frames over one
+// WebSocket: the client sends {type:'open',streamId,endpoint,payload} /
+// {type:'cancel',streamId}; the server answers {type:'item'|'error'|'end'}.
+// dsh-rpc opens a stream per call and cancels it after the first item, reusing
+// the connection.
+let muxSocket = null;
+let muxReady = null;
+const muxHandlers = new Map();
+let muxSeq = 0;
+
+function muxUrl() {
+  return BASE.replace(/^http/u, 'ws') + '/api/remote.mux';
+}
+
+function failMuxOpeners(message) {
+  for (const handle of muxHandlers.values()) {
+    clearTimeout(handle.timer);
+    handle.reject(new Error(message));
+  }
+  muxHandlers.clear();
+}
+
+function resetMux() {
+  muxSocket = null;
+  muxReady = null;
+}
+
+function trySend(ws, frame) {
+  try { ws.send(JSON.stringify(frame)); } catch { /* socket is dying; pending opens fail via close/error */ }
+}
+
+async function getMux() {
+  if (muxSocket && muxSocket.readyState <= 1) {
+    await muxReady;
+    return muxSocket;
+  }
+  if (typeof WebSocket !== 'function') {
+    throw new Error('live state on this dsh build is stream-only; dsh-rpc needs Node >= 22 (built-in WebSocket)');
+  }
+  muxHandlers.clear();
+  resetMux();
+  const ws = new WebSocket(muxUrl(), { headers: { cookie: await wsCookie() } });
+  let readyOk; let readyErr;
+  muxReady = new Promise((resolve, reject) => { readyOk = resolve; readyErr = reject; });
+  const drop = (reason) => {
+    failMuxOpeners(`mux ${reason}`);
+    resetMux();
+  };
+  ws.addEventListener('open', () => readyOk());
+  ws.addEventListener('error', () => {
+    const err = new Error(`mux connection to ${muxUrl()} failed — is the web UI running?`);
+    if (readyErr) readyErr(err);
+    drop('connection error');
+  });
+  ws.addEventListener('close', () => drop('connection closed'));
+  ws.addEventListener('message', (ev) => {
+    let m;
+    try { m = JSON.parse(String(ev.data)); } catch { return; }
+    const handle = m && typeof m.streamId === 'string' ? muxHandlers.get(m.streamId) : undefined;
+    if (!handle) return;
+    if (m.type === 'item') {
+      if (!handle.done) {
+        handle.done = true;
+        clearTimeout(handle.timer);
+        muxHandlers.delete(m.streamId);
+        trySend(ws, { type: 'cancel', streamId: m.streamId });
+        handle.resolve(m.value);
+      }
+    } else if (m.type === 'error') {
+      clearTimeout(handle.timer);
+      muxHandlers.delete(m.streamId);
+      const err = m.error || {};
+      handle.reject(new Error(`${handle.endpoint} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`));
+    } else if (m.type === 'end' && !handle.done) {
+      clearTimeout(handle.timer);
+      muxHandlers.delete(m.streamId);
+      handle.reject(new Error(`${handle.endpoint} stream ended before the opening frame`));
+    }
+  });
+  muxSocket = ws;
+  await muxReady;
+  return ws;
+}
+
+// Open one logical stream and resolve with its first item value (the baseline
+// or snapshot frame). The stream is cancelled as soon as that item lands.
+async function muxOpen(endpoint, args) {
+  const ws = await getMux();
+  muxSeq += 1;
+  const streamId = `cli-${muxSeq}`;
+  return new Promise((resolve, reject) => {
+    const handle = { endpoint, resolve, reject, done: false, timer: null };
+    handle.timer = setTimeout(() => {
+      muxHandlers.delete(streamId);
+      reject(new Error(`${endpoint} stream timed out after ${RPC_TIMEOUT_MS}ms`));
+    }, RPC_TIMEOUT_MS);
+    muxHandlers.set(streamId, handle);
+    trySend(ws, { type: 'open', streamId, endpoint, payload: { args: args || {} } });
+  });
+}
 
 // While a session is being waited on, SIGINT (Ctrl-C) cancels it instead of
 // leaving it running unattended — matching the tool's cancel-on-approval /
@@ -78,39 +295,46 @@ process.on('SIGINT', () => {
     .finally(() => process.exit(130));
 });
 
-async function rpc(method, payload) {
+async function rpc(endpoint, args) {
   const rpcId = uuid();
+  const cookie = await wsCookie();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
   try {
     let res;
     try {
-      res = await fetch(`${BASE}/api/${method}`, {
+      res = await fetch(`${BASE}/api/${endpoint}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'client-request', rpcId, method, payload: payload || {} }),
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ type: 'client-request', rpcId, method: endpoint, payload: { args: args || {} } }),
         signal: controller.signal,
       });
     } catch (e) {
       if (controller.signal.aborted) {
-        throw new Error(`request to ${method} timed out after ${RPC_TIMEOUT_MS}ms`);
+        throw new Error(`request to ${endpoint} timed out after ${RPC_TIMEOUT_MS}ms`);
       }
       throw new Error(`cannot reach dsh at ${BASE} — is the web UI running? (${e.message})`);
     }
     if (!res.ok) {
       const text = (await res.text().catch(() => '')).slice(0, 200);
-      throw new Error(`transport failure ${res.status} for ${method}${text ? ': ' + text : ''}`);
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(
+          `not authenticated for ${endpoint} (${res.status})${text ? ': ' + text : ''}`
+            + ' — dsh web now requires a signed browser-auth cookie (DSH_AUTH_SECRET or ~/.dsh/.credentials.yaml)',
+        );
+      }
+      throw new Error(`transport failure ${res.status} for ${endpoint}${text ? ': ' + text : ''}`);
     }
     const full = await res.json();
     // Verify the envelope before trusting `result`: it must be a server-response
     // that echoes our rpcId, and it must carry a result. Never trust `result`
     // from a mismatched or malformed reply.
     if (!full || full.type !== 'server-response' || full.rpcId !== rpcId || !full.result) {
-      throw new Error(`malformed or mismatched response for ${method}`);
+      throw new Error(`malformed or mismatched response for ${endpoint}`);
     }
     if (!full.result.ok) {
       const err = full.result.error || {};
-      throw new Error(`${method} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`);
+      throw new Error(`${endpoint} failed: ${err.code || 'unknown'}${err.message ? ': ' + err.message : ''}`);
     }
     return full.result.value;
   } finally {
@@ -155,24 +379,41 @@ function textOf(message) {
 }
 
 async function listWorkspaces() {
-  return (await rpc('workspace.list', {})).items || [];
+  // Workspace state is stream-only in dsh 0.1.2+; the follow opening item is
+  // the full baseline (items + archivedSessionIds).
+  const frame = await muxOpen('workspace/follow', {});
+  if (frame && frame.type === 'baseline') return (frame.value && frame.value.items) || [];
+  return (frame && frame.items) || [];
 }
 
+// The dsh registry stores canonical paths (workspace/create resolves
+// symlinks: /tmp/x is registered as /private/tmp/x on macOS), while the
+// caller's target path is often a symlinked spelling of the same folder.
+// Match on real paths both ways so the workspace for the current project
+// folder is always found; fall back to the raw spelling when a path cannot be
+// realpath'd (e.g. a not-yet-existing --create-workspace target).
 async function findWorkspaceByPath(absPath) {
+  const fsp = await import('node:fs');
+  const real = (p) => {
+    try { return fsp.realpathSync(p); } catch { return p; }
+  };
+  const target = real(absPath);
   const items = await listWorkspaces();
-  return items.find((w) => w.path === absPath);
+  return items.find((w) => real(w.path) === target || w.path === absPath);
 }
 
 // Return the existing workspace for absPath, or (when allowCreate) create it.
 // A missing workspace FAILS unless allowCreate is set — auto-create stays OFF
 // by default so a typo'd path doesn't silently mint a new empty workspace.
+// `workspace/create` is idempotent on the dsh side (existing dir resolves to
+// the same workspaceId), so no listing race can duplicate a workspace.
 async function ensureWorkspace(absPath, allowCreate) {
   const existing = await findWorkspaceByPath(absPath);
   if (existing) return existing;
   if (!allowCreate) {
     throw new Error(`workspace not found at ${absPath} — pass --create-workspace to create it`);
   }
-  const created = await rpc('workspace.create', { path: absPath });
+  const created = await rpc('workspace/create', { request: { path: absPath } });
   return created.workspace;
 }
 
@@ -207,8 +448,26 @@ function computeCheckpoint(history) {
   return { maxSeq, count: events.length };
 }
 
-function getHistory(sessionId) {
-  return rpc('session.history', { sessionId, maxMessages: 200 });
+async function getHistory(sessionId) {
+  // Session journals are stream-only in dsh 0.1.2+: the follow snapshot carries
+  // the message-aligned window the old session.history RPC returned, plus the
+  // projections (permissions!) that plain paging cannot see. Packed chunk-run
+  // records (`type:'chunks'`) hold streaming deltas only; final user/assistant
+  // messages stay plain events, which is what every consumer here reads.
+  const snap = await muxOpen('session/follow', {
+    request: { address: { kind: 'session', sessionId }, maxMessages: 200 },
+  });
+  const records = (snap && snap.records) || [];
+  const events = [];
+  for (const r of records) {
+    if (r && r.type === 'event' && r.event) events.push(r.event);
+  }
+  return {
+    events,
+    projections: (snap && snap.projections) || { values: {} },
+    cursor: snap && typeof snap.cursor === 'number' ? snap.cursor : undefined,
+    hasMore: !!(snap && snap.hasMore),
+  };
 }
 
 function finalAssistantText(history, checkpoint) {
@@ -260,7 +519,7 @@ function pendingApproval(history) {
 }
 
 function cancelSession(sessionId) {
-  return rpc('session.cancel', { sessionId });
+  return rpc('session/cancel', { request: { sessionId } });
 }
 
 // Find the LAST terminal job marker of the form DEEPSEEK_<KIND>:<id> in text.
@@ -318,8 +577,11 @@ async function applyAndVerifyPermission(sessionId, permission) {
   }
   // `commands/execute` on dsh >= 0.1.1-rc.2 requires an `images` arg (array of
   // { mediaType, data, name? }); send an empty array since we never attach media.
+  // The addressing agent rides the generated `agentId` wire name.
   const exec = await rpc('commands/execute', {
-    args: { agentId: sessionId, line: `/permission ${permission}`, images: [] },
+    agentId: sessionId,
+    line: `/permission ${permission}`,
+    images: [],
   });
   if (!exec || !exec.result || exec.result.kind !== 'success') {
     const detail = exec && exec.result && exec.result.text ? `: ${exec.result.text}` : '';
@@ -361,12 +623,12 @@ function describeModels(cat) {
   return parts.join(', ') || '(none loaded)';
 }
 
-// Apply a model selection to a session: fetch the catalog (`session.models`),
+// Apply a model selection to a session: fetch the catalog (`session/modelCatalog`),
 // resolve a bare model id against it (or fill a default reasoning effort), then
 // commit via `session.selectModel`. selectModel is authoritative, but resolving
 // here gives clear errors and avoids guessing at provider/model ids.
 async function applyModelSelection(sessionId, model) {
-  const cat = await rpc('session.models', { sessionId });
+  const cat = await rpc('session/modelCatalog', {});
   let provider = model.provider;
   if (!provider) {
     const matches = [];
@@ -385,9 +647,9 @@ async function applyModelSelection(sessionId, model) {
   if (!entry) throw new Error(`model "${provider}/${model.model}" not found for ${sessionId}; available: ${describeModels(cat)}`);
   let reasoningEffort = model.reasoningEffort;
   if (!reasoningEffort && entry.reasoning && entry.reasoning.defaultEffort) reasoningEffort = entry.reasoning.defaultEffort;
-  const payload = { sessionId, provider, model: model.model };
-  if (reasoningEffort) payload.reasoningEffort = reasoningEffort;
-  await rpc('session.selectModel', payload);
+  const request = { sessionId, provider, model: model.model };
+  if (reasoningEffort) request.reasoningEffort = reasoningEffort;
+  await rpc('session/selectModel', { request });
 }
 
 async function waitForCompletion(sessionId, timeoutMs, quiet, checkpoint, requestedPermission, pollMs) {
@@ -399,7 +661,7 @@ async function waitForCompletion(sessionId, timeoutMs, quiet, checkpoint, reques
     let summary;
     let history;
     try {
-      const list = await rpc('session.list', {});
+      const list = await rpc('session/list', { _request: {} });
       summary = (list.items || []).find((i) => i.sessionId === sessionId);
       history = await getHistory(sessionId);
     } catch (e) {
@@ -439,7 +701,15 @@ async function waitForCompletion(sessionId, timeoutMs, quiet, checkpoint, reques
         const detail = err && err.message ? `: ${err.message}` : '';
         throw new Error(`session ended with reason "${kind}" (not completed)${detail}`);
       }
-      return;
+      // Only treat the run as complete with positive evidence: the session was
+      // observed running (`sawRunning`) or a terminal `turn/end` with reason
+      // "completed" appeared after the checkpoint. A session that never reported
+      // running and produced no completion must NOT be reported done — a turn
+      // that is slow to start would otherwise be falsely completed once the 3s
+      // grace elapses (it keeps polling and cancels on timeout instead).
+      if (sawRunning || kind === 'completed') {
+        return;
+      }
     }
     if (!quiet) {
       const secs = Math.round((Date.now() - start) / 1000);
@@ -472,10 +742,15 @@ async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs,
     // turn/end or answer from an earlier prompt can never be reused as the
     // result of this submission.
     const checkpoint = computeCheckpoint(await getHistory(sessionId));
-    await rpc('session.prompt', {
-      sessionId,
-      mode: 'queue',
-      content: [{ type: 'text', text: task }],
+    // dsh 0.1.2 prompts carry a client-minted requestId persisted on the
+    // accepted user message (reconciles optimistic and durable messages).
+    await rpc('session/prompt', {
+      request: {
+        sessionId,
+        requestId: uuid(),
+        mode: 'queue',
+        content: [{ type: 'text', text: task }],
+      },
     });
     if (!wait) {
       onIdle({ sessionId }, json);
@@ -606,13 +881,14 @@ async function cmdWorkspaces() {
   const items = await listWorkspaces();
   if (!items.length) { console.log('(no workspaces)'); return; }
   for (const w of items) {
-    console.log(`${w.workspaceId}  ${w.title}  [${w.sessionIds.length} sessions]  ${w.path}`);
+    console.log(`${w.workspaceId}  ${w.title}  [${(w.sessionIds || []).length} sessions]  ${w.path}`);
   }
 }
 
 async function cmdSessions() {
-  const list = await rpc('session.list', {});
-  const items = list.items || [];
+  const list = await rpc('session/list', { _request: {} });
+  // A null/absent business value (empty deployment response) must not crash.
+  const items = (list && list.items) || [];
   if (!items.length) { console.log('(no sessions)'); return; }
   for (const s of items) {
     const flags = [s.running ? 'running' : 'idle', s.blank ? 'blank' : 'has-history'].join(',');
@@ -628,7 +904,8 @@ async function cmdRun(args) {
   const timeoutMs = opts.timeout ? parseTimeoutSeconds(opts.timeout, '--timeout') : 10 * 60 * 1000;
   const task = await taskFromOptions(opts, positional.join(' '));
   if (!task) throw new Error(usage);
-  if (opts.permission) checkPermissionAck(opts.permission, opts.allowDanger);
+  const permission = opts.permission || DEFAULT_PERMISSION;
+  checkPermissionAck(permission, opts.allowDanger);
   const modelSel = buildModelSelection(opts.model || null, opts.provider || null, opts.reasoningEffort || null);
 
   const absPath = resolvePath(opts.workspace || null);
@@ -637,13 +914,13 @@ async function cmdRun(args) {
     throw new Error(`workspace at ${absPath} has title "${workspace.title}", expected "${opts.requireTitle}"`);
   }
 
-  const created = await rpc('session.create', { workspaceId: workspace.workspaceId });
+  const created = await rpc('session/create', { request: { workspaceId: workspace.workspaceId } });
   const sessionId = created.sessionId;
   if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
 
   try {
     await runSession({
-      sessionId, task, wait, quiet, permission: opts.permission || null, timeoutMs,
+      sessionId, task, wait, quiet, permission, timeoutMs,
       model: modelSel, jobId: opts.jobId || null, json: !!opts.json,
       pollMs: opts.pollMs ? parsePollMs(opts.pollMs) : null,
       onIdle: (ev, j) => { if (j) console.log(JSON.stringify({ sessionId: ev.sessionId }, null, 2)); else console.log(ev.sessionId); },
@@ -664,12 +941,13 @@ async function cmdPrompt(args) {
   const sessionId = positional[0];
   const task = await taskFromOptions(opts, positional.slice(1).join(' '));
   if (!sessionId || !task) throw new Error(usage);
-  if (opts.permission) checkPermissionAck(opts.permission, opts.allowDanger);
+  const permission = opts.permission || DEFAULT_PERMISSION;
+  checkPermissionAck(permission, opts.allowDanger);
   const modelSel = buildModelSelection(opts.model || null, opts.provider || null, opts.reasoningEffort || null);
   // runSession does NOT cancel this session on error — it may pre-exist and
   // belong to prior work, unlike the fresh session created by `run`.
   await runSession({
-    sessionId, task, wait, quiet, permission: opts.permission || null, timeoutMs,
+    sessionId, task, wait, quiet, permission, timeoutMs,
     model: modelSel, jobId: opts.jobId || null, json: !!opts.json,
     pollMs: opts.pollMs ? parsePollMs(opts.pollMs) : null,
     onIdle: (ev, j) => { if (j) console.log(JSON.stringify({ sessionId: ev.sessionId, accepted: true }, null, 2)); else console.log(`accepted session ${ev.sessionId}`); },
@@ -700,7 +978,10 @@ async function cmdFork(args) {
   const sessionId = positional[0];
   const task = await taskFromOptions(opts, positional.slice(1).join(' '));
   if (!sessionId) throw new Error(usage);
-  if (opts.permission) checkPermissionAck(opts.permission, opts.allowDanger);
+  // Only task-executing forks (with text) pin the default permission; a bare
+  // fork just branches and must not touch the child's permission.
+  const permission = opts.permission || (task ? DEFAULT_PERMISSION : null);
+  checkPermissionAck(permission, opts.allowDanger);
   const modelSel = buildModelSelection(opts.model || null, opts.provider || null, opts.reasoningEffort || null);
 
   let atSeq;
@@ -709,9 +990,9 @@ async function cmdFork(args) {
     if (!Number.isInteger(atSeq) || atSeq < 0) throw new Error('--at-seq must be a non-negative integer');
   }
 
-  const payload = { sessionId };
-  if (atSeq !== undefined) payload.atSeq = atSeq;
-  const child = await rpc('session.fork', payload);
+  const forkRequest = { sessionId };
+  if (atSeq !== undefined) forkRequest.atSeq = atSeq;
+  const child = await rpc('session/fork', { request: forkRequest });
   const childId = child.sessionId;
   if (!quiet) console.error(`forked ${sessionId} -> ${childId}`);
 
@@ -719,7 +1000,7 @@ async function cmdFork(args) {
 
   try {
     await runSession({
-      sessionId: childId, task, wait, quiet, permission: opts.permission || null, timeoutMs,
+      sessionId: childId, task, wait, quiet, permission, timeoutMs,
       model: modelSel, jobId: opts.jobId || null, json: !!opts.json,
       pollMs: opts.pollMs ? parsePollMs(opts.pollMs) : null,
       onIdle: (ev, j) => { if (j) console.log(JSON.stringify({ sessionId: ev.sessionId }, null, 2)); else console.log(ev.sessionId); },
@@ -735,8 +1016,8 @@ async function cmdFork(args) {
 async function cmdSearch(args) {
   const query = args.join(' ').trim();
   if (!query) throw new Error('usage: dsh-rpc search <query>');
-  const res = await rpc('session.search', { query });
-  const items = res.items || [];
+  const res = await rpc('session/search', { request: { query } });
+  const items = (res && res.items) || [];
   if (!items.length) { console.log('(no matches)'); return; }
   for (const it of items) console.log(`${it.sessionId}\t${it.snippet}`);
   if (res.hasMore) console.error('(more results available)');
@@ -746,7 +1027,7 @@ async function cmdHistory(args) {
   const sessionId = args[0];
   if (!sessionId) throw new Error('usage: dsh-rpc history <sessionId>');
   const history = await getHistory(sessionId);
-  for (const entry of history.events || []) {
+  for (const entry of (history && history.events) || []) {
     const ev = entry.event || entry;
     if (ev.type === 'user/message' && ev.data && ev.data.message) {
       console.log(`\n=== user ===\n${textOf(ev.data.message)}`);
@@ -775,7 +1056,7 @@ async function cmdCall(args) {
 async function cmdStatus(args) {
   const sessionId = args[0];
   if (!sessionId) throw new Error('usage: dsh-rpc status <sessionId>');
-  const list = await rpc('session.list', {});
+  const list = await rpc('session/list', { _request: {} });
   const summary = (list.items || []).find((i) => i.sessionId === sessionId);
   const history = await getHistory(sessionId);
   const turnEnd = latestTurnEnd(history);
@@ -812,9 +1093,11 @@ Usage:
   dsh-rpc workspaces                       list workspaces
   dsh-rpc sessions                         list sessions
   dsh-rpc run <task…|--task-file <f>>      create a grouped session, send task, wait, print result
-       --workspace,-w <path>               target workspace dir (default: cwd)
+       --workspace,-w <path>               target workspace dir (default: cwd; matched by real path,
+                                           so symlinked spellings of the project folder resolve)
        --permission,-p <mode>              set+verify session permission before the task
-                                           (preset must be offered by the deployment; e.g. read-only)
+                                           (default: workspace-write for task runs; preset must be
+                                           offered by the deployment; e.g. read-only)
        --allow-danger-full-access          required acknowledgement for danger-full-access
        --model <model>                     select the model: a bare id, or <provider>/<model>
        --provider <name>                   disambiguate --model across providers (optional)
@@ -839,10 +1122,14 @@ Usage:
   dsh-rpc cancel <sessionId>               explicitly cancel a session
   dsh-rpc search <query>                   search the deployment's session history
   dsh-rpc history <sessionId>              print a session's messages
-  dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session.list '{}')
+  dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session/list '{"request":{"query":"x"}}')
   dsh-rpc version|--version|-V            print the version and repository
 
-Env: DSH_URL (default http://127.0.0.1:3080), DSH_POLL_MS (default 1000)
+Env: DSH_URL (default http://127.0.0.1:3080), DSH_AUTH_SECRET (base64url
+browser-session signing secret; falls back to ~/.dsh/.credentials.yaml as
+written by \`dsh web\`), DSH_POLL_MS (default 1000)
+
+Requires Node >= 22 (built-in WebSocket for the /api/remote.mux stream mux).
 
 Grouped-session guarantee: sessions are created through the same /api path the
 web UI uses, so they appear under their workspace (not as "ungrouped").
@@ -875,7 +1162,19 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`dsh-rpc error: ${err.message}`);
-  process.exit(1);
-});
+// End of command: the shared mux WebSocket keeps the Node event loop alive,
+// so close it explicitly — otherwise every command would hang after printing.
+async function closeMux() {
+  const ws = muxSocket;
+  resetMux();
+  failMuxOpeners('mux connection closed by CLI');
+  if (ws) {
+    try { ws.close(); } catch { /* already closing/closed */ }
+  }
+}
+
+main()
+  .then(closeMux, (err) => {
+    console.error(`dsh-rpc error: ${err.message}`);
+    process.exit(1);
+  });
