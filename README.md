@@ -318,11 +318,15 @@ contributed "guarded runner" proposal
 
 ## Verified against
 
-- dsh source build `dsh-v0.1.2-alpha.2` (`~/Desktop/Developer/deepseek-harness`),
-  verified live 2026-08-31: browser-auth cookies, `/api/<ns>/<m>` routes with
+- dsh source build `dsh-v0.1.2-alpha.3` (`~/Desktop/Developer/deepseek-harness`),
+  verified live 2026-09-01: browser-auth cookies, `/api/<ns>/<m>` routes with
   `{args}` payloads, `commands/execute` with `images: []`, and the
   `/api/remote.mux` stream surface (`workspace/follow` baseline,
-  `session/follow` snapshot with projections).
+  `session/follow` snapshot with projections). The alpha.3 `/api` surface is
+  unchanged from alpha.2 (gateway heartbeat tolerance and client-side history
+  paging were the notable changes).
+- dsh source build `dsh-v0.1.2-alpha.2`, verified live 2026-08-31 (the v0.3.0
+  port's original target).
 
 Older note: on the 0.1.1-rc.2 release, `commands/execute` required an `images`
 argument (dsh-rpc sends `images: []` — it never attaches media).
