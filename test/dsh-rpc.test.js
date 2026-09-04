@@ -490,7 +490,7 @@ test('run: --permission validates against deployment presets (custom preset work
       case 'commands/execute': {
         appliedPermission = (r.args.line || '').replace('/permission ', '');
         assert.strictEqual(r.args.agentId, 'sess-1', 'commands/execute addresses the agent by sessionId');
-        assert.deepStrictEqual(r.args.images, [], 'never attaches media');
+        assert.deepStrictEqual(r.args.submittedAttachments, [], 'never attaches media');
         assert.ok(!r.args.line.includes('danger'), 'line carries the preset only');
         return ok({ result: { kind: 'success', text: 'ok' } });
       }
@@ -523,15 +523,15 @@ test('run: --permission validates against deployment presets (custom preset work
   }
 });
 
-test('run: --permission sends images:[] to commands/execute (required by dsh >= 0.1.1-rc.2)', async () => {
+test('run: --permission sends submittedAttachments:[] to commands/execute (required by dsh >= 0.1.3)', async () => {
   const options = [{ value: 'read-only', name: 'read-only' }];
   let prompted = false;
-  let imagesArg = null;
+  let submittedAttachments = null;
   const { server, port } = await startMock((r) => {
     switch (r.method) {
       case 'session/create': return ok({ sessionId: 'sess-1' });
       case 'commands/execute': {
-        imagesArg = r.args.images;
+        submittedAttachments = r.args.submittedAttachments;
         return ok({ result: { kind: 'success', text: 'ok' } });
       }
       case 'session/prompt': prompted = true; return ok(null);
@@ -548,14 +548,14 @@ test('run: --permission sends images:[] to commands/execute (required by dsh >= 
       value: snapshot(prompted ? [
         { type: 'turn/end', data: { reason: { kind: 'completed' } } },
         { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done' }] } } },
-      ] : [], { values: { permissions: { options, currentValue: imagesArg !== null ? 'read-only' : undefined } } }),
+      ] : [], { values: { permissions: { options, currentValue: submittedAttachments !== null ? 'read-only' : undefined } } }),
     });
   });
   try {
     const res = await runCli(['run', 'do it', '--permission', 'read-only', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
     assert.strictEqual(res.code, 0);
-    assert.ok(Array.isArray(imagesArg), 'commands/execute must receive an images array');
-    assert.strictEqual(imagesArg.length, 0, 'dsh-rpc never attaches media, so images must be empty');
+    assert.ok(Array.isArray(submittedAttachments), 'commands/execute must receive a submittedAttachments array');
+    assert.strictEqual(submittedAttachments.length, 0, 'dsh-rpc never attaches media, so submittedAttachments must be empty');
     void prompted;
   } finally {
     server.close();

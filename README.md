@@ -318,14 +318,24 @@ contributed "guarded runner" proposal
 
 ## Verified against
 
-- dsh source build `dsh-v0.1.2-alpha.2` (`~/Desktop/Developer/deepseek-harness`),
-  verified live 2026-08-31: browser-auth cookies, `/api/<ns>/<m>` routes with
+- dsh source build `dsh-v0.1.3-alpha.1` (`~/Desktop/Developer/deepseek-harness`),
+  verified live 2026-09-04 (dsh-rpc 0.3.1): `commands/execute` renamed its
+  attachments argument from `images` to `submittedAttachments` (a union of
+  encoded images and staged file receipts, added for the new arbitrary-file
+  upload feature) — arg validation rejects unknown fields, so dsh-rpc sends
+  `submittedAttachments: []`. The rest of the surface (browser-auth cookies,
+  `/api/<ns>/<m>` routes with `{args}` payloads, `session/follow` snapshots,
+  history) is unchanged from 0.1.2. Known upstream issue in this release: a
+  performance regression when loading some historical sessions.
+- dsh source build `dsh-v0.1.2-alpha.3` (`~/Desktop/Developer/deepseek-harness`),
+  verified live 2026-09-01: browser-auth cookies, `/api/<ns>/<m>` routes with
   `{args}` payloads, `commands/execute` with `images: []`, and the
   `/api/remote.mux` stream surface (`workspace/follow` baseline,
   `session/follow` snapshot with projections).
 
-Older note: on the 0.1.1-rc.2 release, `commands/execute` required an `images`
-argument (dsh-rpc sends `images: []` — it never attaches media).
+Older notes: on the 0.1.1-rc.2 and 0.1.2 releases, `commands/execute` required
+an `images` argument (dsh-rpc sends `images: []` — it never attaches media);
+dsh 0.1.3+ renamed it to `submittedAttachments`.
 
 ## License
 
