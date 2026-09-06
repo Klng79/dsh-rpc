@@ -498,6 +498,18 @@ function currentPermission(history) {
   return undefined;
 }
 
+// Read the session's plan-mode state from the `plan` projection's cropped wire
+// view ({active, pending} — dsh folds a four-field unit internally but only
+// exposes this view to clients; see planProjectionDefinition.wire in dsh).
+// `null` when the projection is absent (no plan-mode plugin, older dsh).
+function planState(history) {
+  const proj = history && history.projections && history.projections.values && history.projections.values.plan;
+  if (proj && typeof proj.active === 'boolean') {
+    return { active: proj.active, pending: proj.pending === true };
+  }
+  return null;
+}
+
 function latestTurnEnd(history, checkpoint) {
   const events = (history && history.events) || [];
   for (let i = events.length - 1; i >= 0; i--) {
@@ -766,6 +778,7 @@ async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs,
       sessionId,
       running: false,
       permission: currentPermission(history) || null,
+      plan: planState(history) || null,
       pendingApproval: approval ? (approval.id || null) : null,
       turnEndReason: turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : null,
       outcome: null,
@@ -1067,6 +1080,7 @@ async function cmdStatus(args) {
     sessionId,
     running: summary ? !!summary.running : null,
     permission: currentPermission(history) || null,
+    plan: planState(history),
     pendingApproval: approval ? (approval.id || null) : null,
     turnEndReason: turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : null,
     outcome: marker ? marker.kind : null,

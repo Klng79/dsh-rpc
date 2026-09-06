@@ -1029,6 +1029,59 @@ test('status: prints structured JSON evidence', async () => {
     assert.strictEqual(evidence.outcome, 'DONE');
     assert.match(evidence.assistantText, /done result/);
     assert.strictEqual(evidence.pendingApproval, null);
+    assert.strictEqual(evidence.plan, null, 'plan is null when the projection is absent');
+  } finally {
+    server.close();
+  }
+});
+
+test('status: surfaces the plan projection', async () => {
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'session/list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({
+      type: 'item', streamId: frame.streamId,
+      value: snapshot([
+        { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done' }] } } },
+      ], { values: { plan: { active: true, pending: false } } }),
+    });
+  });
+  try {
+    const res = await runCli(['status', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    const evidence = JSON.parse(res.out);
+    assert.deepStrictEqual(evidence.plan, { active: true, pending: false }, 'status evidence carries the plan projection');
+  } finally {
+    server.close();
+  }
+});
+
+test('status: plan pending reflects a queued mode switch', async () => {
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'session/list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({
+      type: 'item', streamId: frame.streamId,
+      value: snapshot([
+        { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done' }] } } },
+      ], { values: { plan: { active: true, pending: true } } }),
+    });
+  });
+  try {
+    const res = await runCli(['status', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    const evidence = JSON.parse(res.out);
+    assert.deepStrictEqual(evidence.plan, { active: true, pending: true }, 'plan.pending reflects a queued switch');
   } finally {
     server.close();
   }
@@ -1241,7 +1294,7 @@ test('run: -- emits literal task text and --json emits structured evidence', asy
         value: snapshot([
           { type: 'turn/end', data: { reason: { kind: 'completed' } } },
           { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'DEEPSEEK_DONE:job9' }] } } },
-        ], { values: { permissions: { currentValue: appliedPermission } } }),
+        ], { values: { permissions: { currentValue: appliedPermission }, plan: { active: true, pending: false } } }),
       });
     }
   });
@@ -1255,6 +1308,7 @@ test('run: -- emits literal task text and --json emits structured evidence', asy
     assert.strictEqual(evidence.assistantText, 'DEEPSEEK_DONE:job9');
     assert.strictEqual(evidence.outcome, 'DONE');
     assert.strictEqual(evidence.turnEndReason, 'completed');
+    assert.deepStrictEqual(evidence.plan, { active: true, pending: false }, 'run evidence carries the plan projection');
   } finally {
     server.close();
   }
