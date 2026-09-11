@@ -318,6 +318,17 @@ contributed "guarded runner" proposal
 
 ## Verified against
 
+- dsh 0.1.5-rc.2 (`~/Desktop/Developer/deepseek-harness`, master), verified live
+  2026-09-11 (dsh-rpc 0.3.1): the full wire surface is unchanged through the
+  0.1.2 → 0.1.5 jump — browser-auth cookies, `/api/<ns>/<m>` routes with
+  `{args}` payloads and the `client-request`/`server-response` envelope,
+  `/api/remote.mux` framing (`workspace/follow` baseline `value.items`,
+  `session/follow` snapshot with `records`/`projections`), the `commands/execute`
+  `submittedAttachments: []` arg, and all 12 RPCs (`session/*`, `workspace/*`).
+  Smoke-tested live (workspaces, sessions, history) plus `npm test` 44/44.
+  The 0.1.5 changes that landed (session-format V3, `SessionHandle` lifecycle,
+  `str_replace_editor` tool default) are on the Python SDK/plugin side, not the
+  web-`/api` wire dsh-rpc talks to.
 - dsh source build `dsh-v0.1.3-alpha.1` (`~/Desktop/Developer/deepseek-harness`),
   verified live 2026-09-04 (dsh-rpc 0.3.1): `commands/execute` renamed its
   attachments argument from `images` to `submittedAttachments` (a union of
