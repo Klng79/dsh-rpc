@@ -1204,6 +1204,159 @@ test('history: prints user and assistant turns and labels injected context', asy
   }
 });
 
+test('queue: lists pending input with its placement, id and text', async () => {
+  const inbox = {
+    'next-turn': [{ id: 'item-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'queued for the next turn' }] }],
+    'next-step': [{ id: 'item-2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'queued for the next step' }] }],
+  };
+  const { server, port } = await startMock(() => ok(null), (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: { inbox } }) });
+  });
+  try {
+    const res = await runCli(['queue', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.deepStrictEqual(res.out.trim().split('\n'), [
+      'next-turn\titem-1\tqueued for the next turn',
+      'next-step\titem-2\tqueued for the next step',
+    ]);
+  } finally {
+    server.close();
+  }
+});
+
+test('queue: --json emits id, placement, text and source', async () => {
+  const inbox = {
+    'next-turn': [{ id: 'item-1', role: 'user', source: { kind: 'plugin', plugin: 'time-context' }, content: [{ type: 'text', text: 'injected' }] }],
+    'next-step': [],
+  };
+  const { server, port } = await startMock(() => ok(null), (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: { inbox } }) });
+  });
+  try {
+    const res = await runCli(['queue', 'sess-1', '--json'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    const parsed = JSON.parse(res.out);
+    assert.strictEqual(parsed.sessionId, 'sess-1');
+    assert.deepStrictEqual(parsed.items, [
+      { id: 'item-1', placement: 'next-turn', text: 'injected', source: 'plugin' },
+    ]);
+  } finally {
+    server.close();
+  }
+});
+
+test('queue: an absent inbox prints (no pending input)', async () => {
+  const { server, port } = await startMock(() => ok(null), (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: {} }) });
+  });
+  try {
+    const res = await runCli(['queue', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.match(res.out, /\(no pending input\)/);
+  } finally {
+    server.close();
+  }
+});
+
+test('queue: remove/steer/edit send the right session/updateQueue action', async () => {
+  const seen = [];
+  const { server, port } = await startMock((r) => {
+    if (r.method === 'session/updateQueue') { seen.push(r.args); return ok({ accepted: true }); }
+    return ok(null);
+  });
+  try {
+    const env = { DSH_URL: `http://127.0.0.1:${port}` };
+    for (const argv of [
+      ['queue', 'sess-1', 'remove', 'item-1'],
+      ['queue', 'sess-1', 'steer', 'item-1'],
+      ['queue', 'sess-1', 'edit', 'item-1', 'replacement', 'text'],
+    ]) {
+      const res = await runCli(argv, env);
+      assert.strictEqual(res.code, 0, `${argv.join(' ')} should succeed`);
+    }
+    assert.strictEqual(seen.length, 3);
+    assert.deepStrictEqual(seen[0], { request: { sessionId: 'sess-1', itemId: 'item-1', action: { kind: 'remove' } } });
+    assert.deepStrictEqual(seen[1], { request: { sessionId: 'sess-1', itemId: 'item-1', action: { kind: 'steer' } } });
+    // dsh rejects non-text content on an edit, so the replacement is text-only
+    // and the positional words are joined into one block.
+    assert.deepStrictEqual(seen[2], {
+      request: { sessionId: 'sess-1', itemId: 'item-1', action: { kind: 'edit', content: [{ type: 'text', text: 'replacement text' }] } },
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('queue: bad action, missing item id and empty edit text are rejected before any RPC', async () => {
+  let hit = false;
+  const { server, port } = await startMock(() => { hit = true; return ok(null); });
+  try {
+    const env = { DSH_URL: `http://127.0.0.1:${port}` };
+    for (const argv of [
+      ['queue'],
+      ['queue', 'sess-1', 'frobnicate', 'item-1'],
+      ['queue', 'sess-1', 'remove'],
+      ['queue', 'sess-1', 'edit', 'item-1'],
+      ['queue', 'sess-1', 'edit', 'item-1', '   '],
+    ]) {
+      const res = await runCli(argv, env);
+      assert.strictEqual(res.code, 1, `${argv.join(' ')} should be rejected`);
+    }
+    assert.strictEqual(hit, false, 'no request should reach the server for a malformed invocation');
+  } finally {
+    server.close();
+  }
+});
+
+test('queue: a rejected updateQueue surfaces the server error', async () => {
+  const { server, port } = await startMock((r) => {
+    if (r.method === 'session/updateQueue') {
+      return { ok: false, error: { code: 'session/queue-item-not-found', message: 'queued item is no longer pending' } };
+    }
+    return ok(null);
+  });
+  try {
+    const res = await runCli(['queue', 'sess-1', 'remove', 'gone'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /queue-item-not-found/);
+    assert.match(res.err, /no longer pending/);
+  } finally {
+    server.close();
+  }
+});
+
+test('rename: renames a session and reports the title the server committed', async () => {
+  let request = null;
+  const { server, port } = await startMock((r) => {
+    if (r.method === 'session/rename') { request = r.args.request; return ok({ title: 'canonical title', seq: 7 }); }
+    return ok(null);
+  });
+  try {
+    const res = await runCli(['rename', 'sess-1', 'my', 'run'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.deepStrictEqual(request, { sessionId: 'sess-1', title: 'my run' });
+    assert.match(res.out, /renamed sess-1 to "canonical title"/);
+  } finally {
+    server.close();
+  }
+});
+
+test('rename: a missing title is rejected before any RPC', async () => {
+  let hit = false;
+  const { server, port } = await startMock(() => { hit = true; return ok(null); });
+  try {
+    const res = await runCli(['rename', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /usage: dsh-rpc rename/);
+    assert.strictEqual(hit, false);
+  } finally {
+    server.close();
+  }
+});
+
 test('run --task-file: reads the task text from a file', async () => {
   const tmp = path.join(os.tmpdir(), `dsh-rpc-task-${Date.now()}.txt`);
   fs.writeFileSync(tmp, 'line one\nline two');

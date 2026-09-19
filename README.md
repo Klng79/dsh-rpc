@@ -106,9 +106,16 @@ dsh-rpc fork <sessionId> [<text…>] [opts]  branch an existing session (child k
       --task-file --job-id <id> --json --poll-ms <ms>
 dsh-rpc search <query>                  search the deployment's session history
 dsh-rpc status <sessionId>              print structured JSON evidence about a session
-                                        (running, permission, plan, agentPreset, modelSelection,
-                                        goal, pendingApproval, turnEndReason, outcome, text)
+                                        (running, title, permission, plan, agentPreset,
+                                        modelSelection, goal, pendingApproval, turnEndReason,
+                                        outcome, text)
+dsh-rpc queue <sessionId>               list pending input (the inbox: next-turn / next-step)
+      --json                            as JSON: id, placement, text, source
+dsh-rpc queue <s> remove <itemId>       retract one pending item
+dsh-rpc queue <s> steer <itemId>        promote one pending item to steer
+dsh-rpc queue <s> edit <itemId> <text…> replace one pending item's text
 dsh-rpc cancel <sessionId>              explicitly cancel a session
+dsh-rpc rename <sessionId> <title…>     label a session (shows in the web UI and in status)
 dsh-rpc history <sessionId>             print a session's messages (user turns, injected context
                                         labelled by source, assistant turns, tool results)
 dsh-rpc call <method> [json]            raw RPC escape hatch
@@ -156,6 +163,13 @@ dsh-rpc status session-xxxx
 
 # Run a stripped-down agent (presets change the whole toolset, not just a prompt)
 dsh-rpc run "fix the failing test" --agent-preset minimal
+
+# Retract a prompt you already submitted while a turn was running
+dsh-rpc queue session-xxxx
+dsh-rpc queue session-xxxx remove 6406db67-e102-4a89-95f2-317678873a72
+
+# Label a run so it is identifiable later
+dsh-rpc rename session-xxxx "nightly audit"
 
 # Raw RPC
 dsh-rpc call session/list '{"_request":{}}'
@@ -226,6 +240,44 @@ on stderr and is visible in `status` as `agentPreset`.
 dsh-rpc call agentPresets/list '{}'   # discover the ids this deployment defines
 ```
 
+## Supervising a session
+
+Three commands cover the "what is it doing, and how do I change my mind" half of
+driving an agent.
+
+**`status`** prints structured JSON: `running`, `title`, `permission`, `plan`,
+`agentPreset`, `modelSelection`, `goal`, `pendingApproval`, `turnEndReason`,
+`outcome`, `assistantText`. Every field already rides the `session/follow`
+snapshot, so it costs one stream and no extra RPCs.
+
+**`queue`** reads and edits pending input. When you submit a prompt while a turn
+is still running, dsh holds it in the session's **inbox** rather than dropping or
+merging it — and `cancel` stops the *turn* but deliberately leaves the inbox
+alone. Without a way to reach that inbox, a prompt submitted by mistake is
+unretractable. It is also visible in the session's `inbox` projection:
+
+```sh
+$ dsh-rpc queue session-xxxx
+next-turn	6406db67-e102-4a89-95f2-317678873a72	rewrite the parser tests
+next-step	9f1c2ab4-...                          also update the changelog
+
+$ dsh-rpc queue session-xxxx remove 6406db67-e102-4a89-95f2-317678873a72
+removed 6406db67-... in session-xxxx
+```
+
+`next-turn` items wait for the current turn to finish; `next-step` items are
+queued for the next model step. `steer` promotes an item so it is delivered at
+the next step instead of the next turn; `edit` replaces its text (dsh accepts
+text-only replacements, so attachments cannot be edited into an item).
+
+**`rename`** labels a session. Titles are a projection, so a renamed session is
+identifiable in the web UI and appears as `title` in `status` — but not in
+`sessions`, whose rows carry no title field.
+
+```sh
+dsh-rpc rename session-xxxx "nightly audit"
+```
+
 ## Output & exit codes
 
 - The final answer (or session id with `--no-wait`) goes to **stdout**;
@@ -247,8 +299,10 @@ the suite covers cookie minting/verification, the RPC envelope, trailing-slash
 approval → cancel path, the non-completed terminal-reason gate,
 deployment-aware `--permission` validation (both the 0.1.6 catalog path and the
 ≤ 0.1.5 projection fallback), the shared `run`/`prompt` completion path, `fork`,
-`search`, `history`, `--agent-preset`, `--model` resolution (bare id, ambiguity,
-and `--provider` validation), `status` projections, and auth-failure guidance.
+`search`, `history`, `--agent-preset`, the `queue` lifecycle (list, `--json`,
+remove/steer/edit, and the malformed-invocation guards), `rename`, `--model`
+resolution (bare id, ambiguity, and `--provider` validation), `status`
+projections, and auth-failure guidance.
 
 **The mock models the server version it claims to.** A mock that encodes an old
 projection shape certifies a server that no longer exists — which is exactly how
@@ -307,9 +361,9 @@ attaches/groups the session), `session/prompt` (client-minted `requestId`),
 `session/list` (carries the `running` flag), `session/follow` (stream journal
 snapshot + projections; replaces `session.history`), `session/fork` (branching),
 `session/search`, `session/modelCatalog` + `session/selectModel` (`--model`),
-`session/cancel`, `commands/execute` (permission presets), and
-`permissionPresets/catalog` (preset discovery; absent before 0.1.6, which is
-detected rather than assumed).
+`session/cancel`, `session/updateQueue` (`queue`), `session/rename` (`rename`),
+`commands/execute` (permission presets), and `permissionPresets/catalog` (preset
+discovery; absent before 0.1.6, which is detected rather than assumed).
 
 **Event payloads are not uniform**, and getting this wrong fails silently.
 `user/message` carries the message *directly* on `event.data`;
@@ -376,7 +430,7 @@ These opt-in guards harden unattended runs. They are additive — the default
   snapshots; there is no live token stream (the mux journal is intentionally
   consumed snapshot-by-snapshot).
 - **The old `(0.1.1-rc.2 and earlier) dot-method surface is no longer
-  supported.** dsh-rpc 0.4.0 targets the 0.1.2+ authed, namespaced surface
+  supported.** dsh-rpc 0.5.0 targets the 0.1.2+ authed, namespaced surface
   exclusively.
 - **The `/api` bridge is unversioned upstream.** dsh publishes no wire version,
   no deprecation policy, and no compatibility promise for it — dsh-rpc lives on
@@ -424,7 +478,7 @@ contributed "guarded runner" proposal
 
 - **dsh 0.1.6-alpha.1** (`~/Desktop/Developer/deepseek-harness`, source tree at
   `dsh-v0.1.6-alpha.1-5-g0d1f50007f`; the `dsh-v0.1.6-alpha.2` tag was also read
-  for the diff), verified live 2026-09-19 (dsh-rpc 0.4.0). All 12 RPCs'
+  for the diff), verified live 2026-09-19 (dsh-rpc 0.4.0–0.5.0). All 12 RPCs'
   request/response shapes, the `client-request`/`server-response` envelope, the
   browser-auth cookie, and the `/api/remote.mux` framing are **byte-identical**
   to 0.1.5-rc.2 — the whole `session-controller/src/types.ts` diff for the jump
@@ -446,12 +500,16 @@ contributed "guarded runner" proposal
     caught it.
   - Live-verified: `workspaces`, `sessions`, `run` (prompt → completion gate →
     final text), `--permission` apply+verify, fail-fast preset rejection with no
-    session created, `history`, `status`, `fork`, `cancel`, `search`, and the
-    stale-credential / unreachable-server / unknown-session failure paths.
-    `npm test` 51/51.
+    session created, `history`, `status`, `fork`, `cancel`, `search`, the full
+    `queue` lifecycle (list a prompt held in the inbox while a turn ran, `remove`
+    it, confirm the inbox emptied — which also confirms `cancel` keeps the inbox),
+    `rename`, and the stale-credential / unreachable-server / unknown-session
+    failure paths. `npm test` 59/59.
   - Alpha.2-only, **not** yet handled (absent at alpha.1): the `session/writer-held`
-    error code, and `session/control` losing its queue frames / `session/updateQueue`
-    resolving cold agents — the latter two unused by dsh-rpc.
+    error code, and `session/control` losing its queue frames — the latter unused
+    by dsh-rpc. `session/updateQueue` resolving cold agents is handled implicitly:
+    `queue` addresses items the snapshot just reported, and the verb is a write,
+    so a build with cold-resolution only widens what already works.
 - dsh 0.1.5-rc.2 (`~/Desktop/Developer/deepseek-harness`, master), verified live
   2026-09-11 (dsh-rpc 0.3.1): the wire surface was unchanged through the
   0.1.2 → 0.1.5 jump — browser-auth cookies, `/api/<ns>/<m>` routes with

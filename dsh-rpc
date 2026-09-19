@@ -71,7 +71,7 @@ const DEFAULT_PERMISSION = 'workspace-write';
 
 // Project identity for `version` / `--version` / `-V`.
 const NAME = 'dsh-rpc';
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const REPO = 'https://github.com/Klng79/dsh-rpc';
 
 function uuid() {
@@ -951,6 +951,9 @@ const FORK_SPEC = Object.assign({}, BASE_SPEC, {
   '--at-seq': { key: 'atSeq', type: 'value' },
   '--no-wait': { key: 'noWait', type: 'bool' },
 });
+const QUEUE_SPEC = {
+  '--json': { key: 'json', type: 'bool' },
+};
 
 function parsePollMs(v) {
   const n = Number(v);
@@ -1190,6 +1193,7 @@ async function cmdStatus(args) {
     plan: planState(history),
     // Supervisor context that already rides the snapshot: which agent preset the
     // session runs, its model selection, and its durable goal (null when unset).
+    title: projectionOf(history, 'title') || null,
     agentPreset: projectionOf(history, 'agentPreset') || null,
     modelSelection: projectionOf(history, 'modelSelection') || null,
     goal: projectionOf(history, 'goal') || null,
@@ -1206,6 +1210,88 @@ async function cmdCancel(args) {
   if (!sessionId) throw new Error('usage: dsh-rpc cancel <sessionId>');
   await cancelSession(sessionId);
   console.log(`cancelled session ${sessionId}`);
+}
+
+// Pending input rides the `inbox` projection every `session/follow` snapshot
+// already carries: {'next-turn': [UserMessage…], 'next-step': [UserMessage…]}.
+// `next-turn` items wait for the current turn to finish; `next-step` ones are
+// queued for the next model step. Each carries the MessageId that
+// `session/updateQueue` addresses — which is the only way to retract or amend a
+// prompt once submitted, since `session/cancel` drops the turn but keeps the
+// inbox.
+function inboxItems(history) {
+  const inbox = projectionOf(history, 'inbox') || {};
+  const items = [];
+  for (const placement of ['next-turn', 'next-step']) {
+    for (const message of inbox[placement] || []) {
+      if (message && typeof message.id === 'string') items.push({ placement, message });
+    }
+  }
+  return items;
+}
+
+// dsh-rpc queue <sessionId>                            list pending input
+// dsh-rpc queue <sessionId> remove <itemId>            retract one item
+// dsh-rpc queue <sessionId> steer <itemId>             promote one item to steer
+// dsh-rpc queue <sessionId> edit <itemId> <text…>      replace one item's text
+async function cmdQueue(args) {
+  const usage = 'usage: dsh-rpc queue <sessionId> [remove|steer|edit <itemId> [text…]] [--json]';
+  const { opts, positional } = parseArgs(args, QUEUE_SPEC, usage);
+  const sessionId = positional[0];
+  if (!sessionId) throw new Error(usage);
+  const action = positional[1];
+
+  if (action === undefined) {
+    const items = inboxItems(await getHistory(sessionId));
+    if (opts.json) {
+      console.log(JSON.stringify({
+        sessionId,
+        items: items.map(({ placement, message }) => ({
+          id: message.id,
+          placement,
+          text: textOf(message),
+          source: (message.source && message.source.kind) || null,
+        })),
+      }, null, 2));
+      return;
+    }
+    if (!items.length) { console.log('(no pending input)'); return; }
+    for (const { placement, message } of items) {
+      // One line per item so the output stays greppable in a script.
+      const text = textOf(message).replace(/\s+/gu, ' ').trim();
+      console.log(`${placement}\t${message.id}\t${text}`);
+    }
+    return;
+  }
+
+  const itemId = positional[2];
+  if (!itemId) throw new Error(usage);
+  let queueAction;
+  let done;
+  if (action === 'remove') { queueAction = { kind: 'remove' }; done = 'removed'; }
+  else if (action === 'steer') { queueAction = { kind: 'steer' }; done = 'promoted to steer'; }
+  else if (action === 'edit') {
+    // dsh rejects non-text content on an edit, and empty text is not a prompt.
+    const text = positional.slice(3).join(' ').trim();
+    if (!text) throw new Error('usage: dsh-rpc queue <sessionId> edit <itemId> <text…>');
+    queueAction = { kind: 'edit', content: [{ type: 'text', text }] };
+    done = 'edited';
+  } else {
+    throw new Error(`unknown queue action "${action}"\n${usage}`);
+  }
+  await rpc('session/updateQueue', { request: { sessionId, itemId, action: queueAction } });
+  console.log(`${done} ${itemId} in ${sessionId}`);
+}
+
+// dsh-rpc rename <sessionId> <title…> — label a session. The title is a
+// projection, so it shows in the web UI and in `status` (`status` reads it from
+// the snapshot), not in the `sessions` list, which carries no title field.
+async function cmdRename(args) {
+  const sessionId = args[0];
+  const title = args.slice(1).join(' ').trim();
+  if (!sessionId || !title) throw new Error('usage: dsh-rpc rename <sessionId> <title…>');
+  const res = await rpc('session/rename', { request: { sessionId, title } });
+  console.log(`renamed ${sessionId} to "${res && res.title ? res.title : title}"`);
 }
 
 async function cmdVersion() {
@@ -1251,9 +1337,16 @@ Usage:
                                            omitted or past the end forks from the last completed turn,
                                            and a turn that has not completed is an error
   dsh-rpc status <sessionId>               print structured JSON evidence about a session
-                                           (running, permission, plan, agentPreset, modelSelection,
-                                           goal, pendingApproval, turnEndReason, outcome, text)
+                                           (running, title, permission, plan, agentPreset,
+                                           modelSelection, goal, pendingApproval, turnEndReason,
+                                           outcome, text)
+  dsh-rpc queue <sessionId>                list pending input (the inbox: next-turn/next-step)
+       [--json]                            as JSON: id, placement, text, source
+  dsh-rpc queue <s> remove <itemId>        retract one pending item
+  dsh-rpc queue <s> steer <itemId>         promote one pending item to steer
+  dsh-rpc queue <s> edit <itemId> <text…>  replace one pending item's text
   dsh-rpc cancel <sessionId>               explicitly cancel a session
+  dsh-rpc rename <sessionId> <title…>      label a session (visible in the web UI and status)
   dsh-rpc search <query>                   search the deployment's session history
   dsh-rpc history <sessionId>              print a session's messages
   dsh-rpc call <method> [json]             raw RPC escape hatch (e.g. call session/list '{"request":{"query":"x"}}')
@@ -1288,6 +1381,8 @@ async function main() {
     case 'call': return cmdCall(rest);
     case 'status': return cmdStatus(rest);
     case 'cancel': return cmdCancel(rest);
+    case 'queue': return cmdQueue(rest);
+    case 'rename': return cmdRename(rest);
     case 'version': case '--version': case '-V': return cmdVersion();
     case 'help': case '--help': case '-h': case undefined:
       console.log(HELP); return;
