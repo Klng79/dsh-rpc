@@ -9,7 +9,8 @@
  * sessions it creates are GROUPED under a workspace exactly like ones created in
  * the web UI (unlike `dsh --profile headless`, which is always ungrouped).
  *
- * Transport (dsh source build dsh-v0.1.2-alpha.2; replaces the 0.1.1-rc.2 surface):
+ * Transport (verified live against dsh source build dsh-v0.1.6-alpha.1; also
+ * covers the 0.1.2 → 0.1.5 surface):
  *   POST <BASE>/api/<namespace>/<method>       (dot methods are gone)
  *   headers: content-type + browser-auth cookie
  *   body: { "type":"client-request", "rpcId":<uuid>, "method":"<ns>/<m>",
@@ -33,10 +34,12 @@
  * same secret dsh persists for the web UI. Requires Node >= 22 for the
  * built-in WebSocket client.
  *
- * Safety features: permission is set via the `commands/execute` RPC + verified
- * against the `permissions` projection; completion requires a `turn/end` with
- * reason "completed"; pending approvals and timeouts cancel the session instead
- * of leaving it running.
+ * Safety features: permission is validated against the deployment's preset
+ * catalog (`permissionPresets/catalog` on dsh >= 0.1.6, else the session
+ * `permissions` projection), set via the `commands/execute` RPC, and verified
+ * against that projection; completion requires a `turn/end` with reason
+ * "completed"; pending approvals and timeouts cancel the session instead of
+ * leaving it running.
  *
  * Environment:
  *   DSH_URL         server base url     (default http://127.0.0.1:3080)
@@ -55,6 +58,11 @@ const POLL_MS = Number(process.env.DSH_POLL_MS || 1000);
 // DSH_RPC_TIMEOUT_MS.
 const RPC_TIMEOUT_MS = Number(process.env.DSH_RPC_TIMEOUT_MS || 30000);
 
+// Budget for the unary probe that explains a failed mux connection (see
+// explainMuxFailure). Local loopback answers in milliseconds, so this only
+// bounds the pathological case where the server accepts and never replies.
+const MUX_DIAGNOSE_MS = 3000;
+
 // Permission applied to task-execution runs (run / prompt / fork <text>) when
 // the caller does not pass --permission. dsh's own default for new sessions is
 // wider (this deployment: danger-full-access), so unattended task runs are
@@ -63,7 +71,7 @@ const DEFAULT_PERMISSION = 'workspace-write';
 
 // Project identity for `version` / `--version` / `-V`.
 const NAME = 'dsh-rpc';
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 const REPO = 'https://github.com/Klng79/dsh-rpc';
 
 function uuid() {
@@ -201,6 +209,24 @@ function trySend(ws, frame) {
   try { ws.send(JSON.stringify(frame)); } catch { /* socket is dying; pending opens fail via close/error */ }
 }
 
+// The browser WebSocket API surfaces a rejected upgrade as a bare `error` event
+// with no HTTP status, so a stale credential and a dead server look identical at
+// the socket. The unary route does carry a status, so probe it and report what
+// it says — that is what turns a misleading "is the web UI running?" into the
+// real "not authenticated (401)" or "cannot reach dsh" guidance. Bounded and
+// non-throwing: it only explains a failure that already happened, and must never
+// add its own delay (or its own error) to that failure.
+async function explainMuxFailure() {
+  const fallback = `mux connection to ${muxUrl()} failed — is the web UI running?`;
+  const probe = rpc('session/list', { _request: {} }).then(
+    // Unary works, so the server is up and the credential is good — the stream
+    // bridge itself is what failed.
+    () => `mux connection to ${muxUrl()} failed (unary RPC works, so the stream bridge is unavailable)`,
+    (e) => (e && e.message ? e.message : fallback),
+  );
+  return Promise.race([probe, sleep(MUX_DIAGNOSE_MS).then(() => fallback)]);
+}
+
 async function getMux() {
   if (muxSocket && muxSocket.readyState <= 1) {
     await muxReady;
@@ -212,17 +238,21 @@ async function getMux() {
   muxHandlers.clear();
   resetMux();
   const ws = new WebSocket(muxUrl(), { headers: { cookie: await wsCookie() } });
-  let readyOk; let readyErr;
-  muxReady = new Promise((resolve, reject) => { readyOk = resolve; readyErr = reject; });
+  let readyOk; let readyErr; let readySettled = false;
+  muxReady = new Promise((resolve, reject) => {
+    readyOk = () => { readySettled = true; resolve(); };
+    readyErr = reject;
+  });
   const drop = (reason) => {
     failMuxOpeners(`mux ${reason}`);
     resetMux();
   };
   ws.addEventListener('open', () => readyOk());
   ws.addEventListener('error', () => {
-    const err = new Error(`mux connection to ${muxUrl()} failed — is the web UI running?`);
-    if (readyErr) readyErr(err);
     drop('connection error');
+    if (readySettled) return;
+    readySettled = true;
+    explainMuxFailure().then((message) => readyErr(new Error(message)));
   });
   ws.addEventListener('close', () => drop('connection closed'));
   ws.addEventListener('message', (ev) => {
@@ -323,7 +353,12 @@ async function rpc(endpoint, args) {
             + ' — dsh web now requires a signed browser-auth cookie (DSH_AUTH_SECRET or ~/.dsh/.credentials.yaml)',
         );
       }
-      throw new Error(`transport failure ${res.status} for ${endpoint}${text ? ': ' + text : ''}`);
+      // An absent RPC route answers 404 at the transport layer, not with an
+      // error envelope; the status lets feature detection tell "this build has
+      // no such verb" apart from a real transport failure.
+      const err = new Error(`transport failure ${res.status} for ${endpoint}${text ? ': ' + text : ''}`);
+      err.status = res.status;
+      throw err;
     }
     const full = await res.json();
     // Verify the envelope before trusting `result`: it must be a server-response
@@ -498,12 +533,19 @@ function currentPermission(history) {
   return undefined;
 }
 
+// One projection's client-visible value from a history snapshot (undefined when
+// the projection is absent on this deployment).
+function projectionOf(history, key) {
+  const values = history && history.projections && history.projections.values;
+  return values ? values[key] : undefined;
+}
+
 // Read the session's plan-mode state from the `plan` projection's cropped wire
 // view ({active, pending} — dsh folds a four-field unit internally but only
 // exposes this view to clients; see planProjectionDefinition.wire in dsh).
 // `null` when the projection is absent (no plan-mode plugin, older dsh).
 function planState(history) {
-  const proj = history && history.projections && history.projections.values && history.projections.values.plan;
+  const proj = projectionOf(history, 'plan');
   if (proj && typeof proj.active === 'boolean') {
     return { active: proj.active, pending: proj.pending === true };
   }
@@ -560,33 +602,72 @@ async function readTextFile(p) {
   return fs.readFileSync(resolvePath(p), 'utf8');
 }
 
-// Extract the preset names a deployment actually offers, from the session's
-// `permissions` projection (projections.values.permissions.options). Tolerates
-// options being an array of strings or of objects ({name|value|id|key}).
-function permissionPresetNames(history) {
-  const proj = history && history.projections && history.projections.values && history.projections.values.permissions;
-  const options = proj && proj.options;
+// Extract preset names from a `permissions`/catalog `options` array. Tolerates
+// options being strings or objects ({name|value|id|key}); dsh >= 0.1.6 exposes
+// `value` (the switchable key) alongside the display `name`, and the key is what
+// `/permission <preset>` takes, so `value` wins when both are present.
+function presetNamesFromOptions(options) {
   if (!Array.isArray(options)) return [];
   const names = [];
   for (const o of options) {
     if (typeof o === 'string') { if (o) names.push(o); }
     else if (o && typeof o === 'object') {
-      const n = o.name || o.value || o.id || o.key;
+      const n = o.value || o.name || o.id || o.key;
       if (typeof n === 'string' && n) names.push(n);
     }
   }
   return names;
 }
 
-async function applyAndVerifyPermission(sessionId, permission) {
-  // Deployment-level check: only accept presets this deployment actually offers.
-  // If the projection exposes no options we skip the pre-check and rely on the
-  // verify step below (a wrong preset still fails verification).
-  const history = await getHistory(sessionId);
-  const names = permissionPresetNames(history);
+// Preset names from the session's `permissions` projection. dsh <= 0.1.5 folded
+// the whole catalog into this projection (`{options, currentValue}`); dsh 0.1.6
+// reduced it to the durable selection alone (`{currentValue}`) and moved the
+// catalog to the process-level `permissionPresets/catalog` Remote. This stays as
+// the fallback for builds that predate that route.
+function permissionPresetNames(history) {
+  const proj = history && history.projections && history.projections.values && history.projections.values.permissions;
+  return presetNamesFromOptions(proj && proj.options);
+}
+
+// The deployment's selectable presets from the process-level catalog Remote
+// (dsh >= 0.1.6). Returns null when the route does not exist on this build —
+// including when no permission service is composed — so callers fall back to
+// the session projection instead of failing. A 404 is the gateway's answer for
+// an unregistered verb (there is no error envelope for a missing route).
+async function fetchPermissionCatalog() {
+  try {
+    const cat = await rpc('permissionPresets/catalog', {});
+    return presetNamesFromOptions(cat && cat.options);
+  } catch (e) {
+    if (e && e.status === 404) return null;
+    throw e;
+  }
+}
+
+// Resolve the preset names this deployment offers, preferring the process
+// catalog, and reject a preset it does not offer. Returns the resolved names,
+// or undefined when only the session projection could answer and no session
+// exists yet (the caller re-resolves once one does). `undefined` means
+// "unknown", never "empty": the verify step still catches a rejected preset.
+async function resolveOfferedPresets(permission, sessionId) {
+  let names = await fetchPermissionCatalog();
+  if (names === null) {
+    if (!sessionId) return undefined;
+    names = permissionPresetNames(await getHistory(sessionId));
+  }
   if (names.length && !names.includes(permission)) {
     throw new Error(`permission "${permission}" is not offered by this deployment; available: ${names.join(', ')}`);
   }
+  return names;
+}
+
+async function applyAndVerifyPermission(sessionId, permission, offeredPresets) {
+  // Deployment-level check: only accept presets this deployment actually offers.
+  // When the caller already validated against the process catalog (before the
+  // session existed) this is a no-op; otherwise resolve from the session. If no
+  // source exposes options we skip the pre-check and rely on the verify step
+  // below (a wrong preset still fails verification).
+  if (offeredPresets === undefined) await resolveOfferedPresets(permission, sessionId);
   // `commands/execute` requires an empty attachments array: dsh 0.1.2 named it
   // `images`, dsh >= 0.1.3 renamed it to `submittedAttachments`. We never
   // attach media. The addressing agent rides the generated `agentId` wire name.
@@ -739,11 +820,11 @@ async function waitForCompletion(sessionId, timeoutMs, quiet, checkpoint, reques
 // or wait for completion and print the final assistant text. Whether to cancel
 // the session on error is left to the caller: `run`/`fork` cancel their
 // freshly-created session, `prompt` does not (that session may pre-exist).
-async function runSession({ sessionId, task, wait, quiet, permission, timeoutMs, model, onIdle, jobId, json, pollMs }) {
+async function runSession({ sessionId, task, wait, quiet, permission, offeredPresets, timeoutMs, model, onIdle, jobId, json, pollMs }) {
   activeSession = sessionId;
   try {
     if (permission) {
-      await applyAndVerifyPermission(sessionId, permission);
+      await applyAndVerifyPermission(sessionId, permission, offeredPresets);
       if (!quiet) console.error(`verified permission ${permission}`);
     }
     if (model) {
@@ -860,6 +941,7 @@ const BASE_SPEC = {
 const RUN_SPEC = Object.assign({}, BASE_SPEC, {
   '--workspace': { key: 'workspace', type: 'value' },
   '-w': { key: 'workspace', type: 'value' },
+  '--agent-preset': { key: 'agentPreset', type: 'value' },
   '--no-wait': { key: 'noWait', type: 'bool' },
 });
 const PROMPT_SPEC = Object.assign({}, BASE_SPEC, {
@@ -910,7 +992,7 @@ async function cmdSessions() {
 }
 
 async function cmdRun(args) {
-  const usage = 'usage: dsh-rpc run <task…|--task-file <f>> [--workspace <path>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>] [--job-id <id>] [--json] [--poll-ms <ms>] [--create-workspace] [--require-title <title>]';
+  const usage = 'usage: dsh-rpc run <task…|--task-file <f>> [--workspace <path>] [--permission <mode>] [--agent-preset <id>] [--model <model>] [--no-wait] [--timeout <sec>] [--job-id <id>] [--json] [--poll-ms <ms>] [--create-workspace] [--require-title <title>]';
   const { opts, positional } = parseArgs(args, RUN_SPEC, usage);
   const wait = !opts.noWait;
   const quiet = !!opts.quiet;
@@ -920,6 +1002,11 @@ async function cmdRun(args) {
   const permission = opts.permission || DEFAULT_PERMISSION;
   checkPermissionAck(permission, opts.allowDanger);
   const modelSel = buildModelSelection(opts.model || null, opts.provider || null, opts.reasoningEffort || null);
+  // Validate the preset before creating anything, when the deployment exposes
+  // its catalog (dsh >= 0.1.6). A bad --permission then fails without minting —
+  // and having to cancel — a session. Older builds answer this after creation,
+  // from the session's own projection (offeredPresets stays undefined).
+  const offeredPresets = await resolveOfferedPresets(permission);
 
   const absPath = resolvePath(opts.workspace || null);
   const workspace = await ensureWorkspace(absPath, opts.createWorkspace);
@@ -927,13 +1014,18 @@ async function cmdRun(args) {
     throw new Error(`workspace at ${absPath} has title "${workspace.title}", expected "${opts.requireTitle}"`);
   }
 
-  const created = await rpc('session/create', { request: { workspaceId: workspace.workspaceId } });
+  const createRequest = { workspaceId: workspace.workspaceId };
+  if (opts.agentPreset) createRequest.agentPreset = opts.agentPreset;
+  const created = await rpc('session/create', { request: createRequest });
   const sessionId = created.sessionId;
-  if (!quiet) console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})`);
+  if (!quiet) {
+    const preset = created.agentPreset ? ` [preset: ${created.agentPreset}]` : '';
+    console.error(`session ${sessionId} in workspace "${workspace.title}" (${workspace.path})${preset}`);
+  }
 
   try {
     await runSession({
-      sessionId, task, wait, quiet, permission, timeoutMs,
+      sessionId, task, wait, quiet, permission, offeredPresets, timeoutMs,
       model: modelSel, jobId: opts.jobId || null, json: !!opts.json,
       pollMs: opts.pollMs ? parsePollMs(opts.pollMs) : null,
       onIdle: (ev, j) => { if (j) console.log(JSON.stringify({ sessionId: ev.sessionId }, null, 2)); else console.log(ev.sessionId); },
@@ -957,10 +1049,11 @@ async function cmdPrompt(args) {
   const permission = opts.permission || DEFAULT_PERMISSION;
   checkPermissionAck(permission, opts.allowDanger);
   const modelSel = buildModelSelection(opts.model || null, opts.provider || null, opts.reasoningEffort || null);
+  const offeredPresets = await resolveOfferedPresets(permission);
   // runSession does NOT cancel this session on error — it may pre-exist and
   // belong to prior work, unlike the fresh session created by `run`.
   await runSession({
-    sessionId, task, wait, quiet, permission, timeoutMs,
+    sessionId, task, wait, quiet, permission, offeredPresets, timeoutMs,
     model: modelSel, jobId: opts.jobId || null, json: !!opts.json,
     pollMs: opts.pollMs ? parsePollMs(opts.pollMs) : null,
     onIdle: (ev, j) => { if (j) console.log(JSON.stringify({ sessionId: ev.sessionId, accepted: true }, null, 2)); else console.log(`accepted session ${ev.sessionId}`); },
@@ -969,8 +1062,9 @@ async function cmdPrompt(args) {
 
 // CLI-level acknowledgement guard (no server call): the full-access preset is
 // only reachable when the user passes --allow-danger-full-access. Whether the
-// deployment actually offers the requested preset is validated against its
-// `permissions` projection inside applyAndVerifyPermission.
+// deployment actually offers the requested preset is resolved by
+// resolveOfferedPresets — from the process catalog where the build exposes one,
+// else from the session's `permissions` projection.
 function checkPermissionAck(permission, allowDangerFullAccess) {
   if (permission === 'danger-full-access' && !allowDangerFullAccess) {
     throw new Error('permission danger-full-access requires the explicit --allow-danger-full-access acknowledgement');
@@ -996,6 +1090,8 @@ async function cmdFork(args) {
   const permission = opts.permission || (task ? DEFAULT_PERMISSION : null);
   checkPermissionAck(permission, opts.allowDanger);
   const modelSel = buildModelSelection(opts.model || null, opts.provider || null, opts.reasoningEffort || null);
+  // A bare fork (no text) never applies a permission, so it resolves nothing.
+  const offeredPresets = permission ? await resolveOfferedPresets(permission) : undefined;
 
   let atSeq;
   if (opts.atSeq !== undefined) {
@@ -1013,7 +1109,7 @@ async function cmdFork(args) {
 
   try {
     await runSession({
-      sessionId: childId, task, wait, quiet, permission, timeoutMs,
+      sessionId: childId, task, wait, quiet, permission, offeredPresets, timeoutMs,
       model: modelSel, jobId: opts.jobId || null, json: !!opts.json,
       pollMs: opts.pollMs ? parsePollMs(opts.pollMs) : null,
       onIdle: (ev, j) => { if (j) console.log(JSON.stringify({ sessionId: ev.sessionId }, null, 2)); else console.log(ev.sessionId); },
@@ -1042,8 +1138,19 @@ async function cmdHistory(args) {
   const history = await getHistory(sessionId);
   for (const entry of (history && history.events) || []) {
     const ev = entry.event || entry;
-    if (ev.type === 'user/message' && ev.data && ev.data.message) {
-      console.log(`\n=== user ===\n${textOf(ev.data.message)}`);
+    if (ev.type === 'user/message' && ev.data) {
+      // A `user/message` event's data IS the message ({id, role, content,
+      // source}) — unlike `assistant/message` and `tool/result`, which wrap
+      // theirs under `data.message`. Reading `data.message` here silently
+      // dropped every user turn.
+      const text = textOf(ev.data);
+      if (text.trim() === '') continue;
+      // Non-`user` sources are the loop injecting context (time, AGENTS.md,
+      // skill content, file-change notices); label them so operator input and
+      // machine-injected context are not confused in the transcript.
+      const source = ev.data.source || {};
+      const label = source.kind === 'user' ? 'user' : `context (${source.plugin || source.kind || 'unknown'})`;
+      console.log(`\n=== ${label} ===\n${text}`);
     } else if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
       const text = textOf(ev.data.message);
       if (text.trim() !== '') console.log(`\n=== assistant ===\n${text}`);
@@ -1081,6 +1188,11 @@ async function cmdStatus(args) {
     running: summary ? !!summary.running : null,
     permission: currentPermission(history) || null,
     plan: planState(history),
+    // Supervisor context that already rides the snapshot: which agent preset the
+    // session runs, its model selection, and its durable goal (null when unset).
+    agentPreset: projectionOf(history, 'agentPreset') || null,
+    modelSelection: projectionOf(history, 'modelSelection') || null,
+    goal: projectionOf(history, 'goal') || null,
     pendingApproval: approval ? (approval.id || null) : null,
     turnEndReason: turnEnd && turnEnd.data && turnEnd.data.reason ? turnEnd.data.reason.kind : null,
     outcome: marker ? marker.kind : null,
@@ -1109,6 +1221,8 @@ Usage:
   dsh-rpc run <task…|--task-file <f>>      create a grouped session, send task, wait, print result
        --workspace,-w <path>               target workspace dir (default: cwd; matched by real path,
                                            so symlinked spellings of the project folder resolve)
+       --agent-preset <id>                 agent preset for the new session (e.g. standard, ptc,
+                                           minimal, cordis; deployment-defined)
        --permission,-p <mode>              set+verify session permission before the task
                                            (default: workspace-write for task runs; preset must be
                                            offered by the deployment; e.g. read-only)
@@ -1132,7 +1246,13 @@ Usage:
   dsh-rpc fork <sessionId> [<text…>] [opts]  branch an existing session (child keeps workspace grouping)
        [--at-seq <n>] [--permission <mode>] [--model <model>] [--no-wait] [--timeout <sec>]
        [--task-file <f>] [--job-id <id>] [--json] [--poll-ms <ms>]
+       --at-seq <n>                        fork at the END of the completed turn containing event n
+                                           (the child seeds that turn inclusive, nothing after it);
+                                           omitted or past the end forks from the last completed turn,
+                                           and a turn that has not completed is an error
   dsh-rpc status <sessionId>               print structured JSON evidence about a session
+                                           (running, permission, plan, agentPreset, modelSelection,
+                                           goal, pendingApproval, turnEndReason, outcome, text)
   dsh-rpc cancel <sessionId>               explicitly cancel a session
   dsh-rpc search <query>                   search the deployment's session history
   dsh-rpc history <sessionId>              print a session's messages
@@ -1148,8 +1268,10 @@ Requires Node >= 22 (built-in WebSocket for the /api/remote.mux stream mux).
 Grouped-session guarantee: sessions are created through the same /api path the
 web UI uses, so they appear under their workspace (not as "ungrouped").
 
-Safety behavior: with --permission the preset is applied via commands/execute and
-verified before the task is submitted; completion requires a turn/end with reason
+Safety behavior: with --permission the preset is validated against the
+deployment's preset catalog (permissionPresets/catalog on dsh >= 0.1.6, else the
+session permissions projection), applied via commands/execute, and verified
+before the task is submitted; completion requires a turn/end with reason
 "completed"; a pending approval, a timeout, a permission drift, or Ctrl-C cancels
 the session instead of leaving it running.`;
 

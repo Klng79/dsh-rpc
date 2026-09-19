@@ -474,7 +474,7 @@ test('run: a non-completed "error" turn/end surfaces the underlying error messag
     server.close();
   }
 });
-test('run: --permission validates against deployment presets (custom preset works)', async () => {
+test('run: --permission validates against the process catalog (dsh >= 0.1.6, custom preset works)', async () => {
   let listCalls = 0;
   let appliedPermission = null;
   let prompted = false;
@@ -483,9 +483,14 @@ test('run: --permission validates against deployment presets (custom preset work
     { value: 'workspace-write', name: 'workspace-write' },
     { value: 'custom-audit', name: 'custom-audit' },
   ];
-  const projections = () => ({ values: { permissions: { options, currentValue: appliedPermission } } });
+  // dsh 0.1.6 dropped `options` from the session projection — it carries the
+  // durable selection only — and moved the selectable set to a process-level
+  // catalog Remote. Modelling both is the point: the old mock shape certified a
+  // server that no longer exists.
+  const projections = () => ({ values: { permissions: { currentValue: appliedPermission } } });
   const { server, port } = await startMock((r) => {
     switch (r.method) {
+      case 'permissionPresets/catalog': return ok({ options });
       case 'session/create': return ok({ sessionId: 'sess-1' });
       case 'commands/execute': {
         appliedPermission = (r.args.line || '').replace('/permission ', '');
@@ -524,11 +529,11 @@ test('run: --permission validates against deployment presets (custom preset work
 });
 
 test('run: --permission sends submittedAttachments:[] to commands/execute (required by dsh >= 0.1.3)', async () => {
-  const options = [{ value: 'read-only', name: 'read-only' }];
   let prompted = false;
   let submittedAttachments = null;
   const { server, port } = await startMock((r) => {
     switch (r.method) {
+      case 'permissionPresets/catalog': return ok({ options: [{ value: 'read-only', name: 'read-only' }] });
       case 'session/create': return ok({ sessionId: 'sess-1' });
       case 'commands/execute': {
         submittedAttachments = r.args.submittedAttachments;
@@ -548,7 +553,7 @@ test('run: --permission sends submittedAttachments:[] to commands/execute (requi
       value: snapshot(prompted ? [
         { type: 'turn/end', data: { reason: { kind: 'completed' } } },
         { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'done' }] } } },
-      ] : [], { values: { permissions: { options, currentValue: submittedAttachments !== null ? 'read-only' : undefined } } }),
+      ] : [], { values: { permissions: { currentValue: submittedAttachments !== null ? 'read-only' : undefined } } }),
     });
   });
   try {
@@ -562,13 +567,46 @@ test('run: --permission sends submittedAttachments:[] to commands/execute (requi
   }
 });
 
-test('run: --permission not offered by the deployment is rejected (fresh session cancelled)', async () => {
+test('run: --permission not offered is rejected before any session is created (dsh >= 0.1.6)', async () => {
   const calls = [];
   let executed = false;
-  const options = [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }];
   const { server, port } = await startMock((r) => {
     calls.push(r.method);
     switch (r.method) {
+      case 'permissionPresets/catalog':
+        return ok({ options: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }] });
+      case 'session/create': return ok({ sessionId: 'sess-1' });
+      case 'commands/execute': { executed = true; return ok({ result: { kind: 'success' } }); }
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint === 'workspace/follow') {
+      send({ type: 'item', streamId: frame.streamId, value: baseline([wksp('ws1', 'T', ['sess-1'])]) });
+    } else if (frame.endpoint === 'session/follow') {
+      send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: { permissions: { currentValue: null } } }) });
+    }
+  });
+  try {
+    const res = await runCli(['run', 'do it', '--permission', 'nope', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /not offered/);
+    assert.match(res.err, /workspace-write/);
+    assert.strictEqual(executed, false, 'commands/execute must not run');
+    assert.ok(!calls.includes('session/create'), 'a preset the deployment does not offer must fail before anything is created');
+    assert.ok(!calls.includes('session/cancel'), 'nothing was created, so nothing should need cancelling');
+  } finally {
+    server.close();
+  }
+});
+
+test('run: --permission falls back to the session projection when the catalog route is absent (dsh <= 0.1.5)', async () => {
+  const calls = [];
+  let executed = false;
+  const { server, port } = await startMock((r) => {
+    calls.push(r.method);
+    switch (r.method) {
+      // An unregistered verb is a transport-level 404, not an error envelope.
+      case 'permissionPresets/catalog': return { $status: 404, text: 'not found' };
       case 'session/create': return ok({ sessionId: 'sess-1' });
       case 'commands/execute': { executed = true; return ok({ result: { kind: 'success' } }); }
       default: return ok(null);
@@ -579,7 +617,7 @@ test('run: --permission not offered by the deployment is rejected (fresh session
     } else if (frame.endpoint === 'session/follow') {
       send({
         type: 'item', streamId: frame.streamId,
-        value: snapshot([], { values: { permissions: { options } } }),
+        value: snapshot([], { values: { permissions: { options: [{ value: 'read-only', name: 'read-only' }] } } }),
       });
     }
   });
@@ -587,9 +625,9 @@ test('run: --permission not offered by the deployment is rejected (fresh session
     const res = await runCli(['run', 'do it', '--permission', 'nope', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
     assert.strictEqual(res.code, 1);
     assert.match(res.err, /not offered/);
-    assert.match(res.err, /workspace-write/);
     assert.strictEqual(executed, false, 'commands/execute must not run');
-    assert.ok(calls.includes('session/cancel'), 'fresh session should be cancelled on error');
+    assert.ok(calls.includes('session/create'), 'without a catalog the session exists before the projection can answer');
+    assert.ok(calls.includes('session/cancel'), 'the fresh session should be cancelled on error');
   } finally {
     server.close();
   }
@@ -961,14 +999,12 @@ test('checkpoint: a stale turn/end + answer from before the prompt is not reused
 test('run: permission drift during polling cancels the session', async () => {
   const calls = [];
   let prompted = false;
-  const options = [
-    { value: 'read-only', name: 'read-only' },
-    { value: 'workspace-write', name: 'workspace-write' },
-  ];
   let appliedPermission = 'read-only';
   const { server, port } = await startMock((r) => {
     calls.push(r.method);
     switch (r.method) {
+      case 'permissionPresets/catalog':
+        return ok({ options: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }] });
       case 'session/create': return ok({ sessionId: 'sess-1' });
       case 'commands/execute': {
         appliedPermission = (r.args.line || '').replace('/permission ', '');
@@ -987,7 +1023,7 @@ test('run: permission drift during polling cancels the session', async () => {
       const drift = prompted ? 'workspace-write' : appliedPermission;
       send({
         type: 'item', streamId: frame.streamId,
-        value: snapshot([], { values: { permissions: { options, currentValue: drift } } }),
+        value: snapshot([], { values: { permissions: { currentValue: drift } } }),
       });
     }
   });
@@ -1082,6 +1118,87 @@ test('status: plan pending reflects a queued mode switch', async () => {
     assert.strictEqual(res.code, 0);
     const evidence = JSON.parse(res.out);
     assert.deepStrictEqual(evidence.plan, { active: true, pending: true }, 'plan.pending reflects a queued switch');
+  } finally {
+    server.close();
+  }
+});
+
+test('status: surfaces the agentPreset, modelSelection and goal projections', async () => {
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'session/list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({
+      type: 'item', streamId: frame.streamId,
+      value: snapshot([], {
+        values: {
+          agentPreset: 'minimal',
+          modelSelection: { next: { provider: 'p', model: 'm' } },
+          goal: { id: 'g1', revision: 2, objective: 'ship it' },
+        },
+      }),
+    });
+  });
+  try {
+    const res = await runCli(['status', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    const evidence = JSON.parse(res.out);
+    assert.strictEqual(evidence.agentPreset, 'minimal');
+    assert.deepStrictEqual(evidence.modelSelection, { next: { provider: 'p', model: 'm' } });
+    assert.deepStrictEqual(evidence.goal, { id: 'g1', revision: 2, objective: 'ship it' });
+  } finally {
+    server.close();
+  }
+});
+
+test('status: absent optional projections stay null rather than undefined', async () => {
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'session/list': return ok({ items: [{ sessionId: 'sess-1', running: false }] });
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: {} }) });
+  });
+  try {
+    const res = await runCli(['status', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    const evidence = JSON.parse(res.out);
+    assert.strictEqual(evidence.agentPreset, null);
+    assert.strictEqual(evidence.modelSelection, null);
+    assert.strictEqual(evidence.goal, null);
+  } finally {
+    server.close();
+  }
+});
+
+test('history: prints user and assistant turns and labels injected context', async () => {
+  const { server, port } = await startMock(() => ok(null), (frame, send) => {
+    if (frame.endpoint !== 'session/follow') return;
+    send({
+      type: 'item', streamId: frame.streamId,
+      value: snapshot([
+        // A `user/message` event's data IS the message ({id, role, content,
+        // source}); unlike assistant/tool events it has no `message` wrapper.
+        { type: 'user/message', data: { role: 'user', source: { kind: 'plugin', plugin: 'time-context' }, content: [{ type: 'text', text: 'Today is Friday.' }] } },
+        { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'what is 2+2' }] } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '4' }] } } },
+        { type: 'tool/result', data: { message: { content: [{ type: 'text', text: 'tool output' }] } } },
+      ], { values: {} }),
+    });
+  });
+  try {
+    const res = await runCli(['history', 'sess-1'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.match(res.out, /=== user ===\nwhat is 2\+2/, 'the operator prompt must appear');
+    assert.match(res.out, /=== context \(time-context\) ===\nToday is Friday\./, 'injected context is labelled by source');
+    assert.match(res.out, /=== assistant ===\n4/);
+    assert.match(res.out, /=== tool-result ===\ntool output/);
+    assert.ok(!/=== user ===\nToday is Friday\./.test(res.out), 'injected context must not masquerade as operator input');
   } finally {
     server.close();
   }
@@ -1380,6 +1497,8 @@ test('run: tasks default to workspace-write permission when --permission is omit
   let listCalls = 0;
   const { server, port } = await startMock((r) => {
     switch (r.method) {
+      case 'permissionPresets/catalog':
+        return ok({ options: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }] });
       case 'session/create': return ok({ sessionId: 'sess-1' });
       case 'commands/execute':
         appliedLine = r.args.line;
@@ -1395,7 +1514,6 @@ test('run: tasks default to workspace-write permission when --permission is omit
       const projections = {
         values: {
           permissions: {
-            options: [{ value: 'read-only', name: 'read-only' }, { value: 'workspace-write', name: 'workspace-write' }],
             currentValue: appliedLine ? appliedLine.replace('/permission ', '') : null,
           },
         },
@@ -1417,6 +1535,80 @@ test('run: tasks default to workspace-write permission when --permission is omit
     assert.strictEqual(appliedLine, '/permission workspace-write', 'unflagged task runs must pin workspace-write (dsh default is wider)');
     assert.match(res.err, /verified permission workspace-write/);
     assert.match(res.out, /default-permission done/);
+  } finally {
+    server.close();
+  }
+});
+
+test('run --agent-preset: passes agentPreset to session/create and reports the resolved preset', async () => {
+  let createRequest = null;
+  let prompted = false;
+  let listCalls = 0;
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'permissionPresets/catalog':
+        return ok({ options: [{ value: 'workspace-write', name: 'workspace-write' }] });
+      case 'session/create': { createRequest = r.args.request; return ok({ sessionId: 'sess-1', agentPreset: 'minimal' }); }
+      case 'session/prompt': prompted = true; return ok(null);
+      case 'session/list': { listCalls++; return ok({ items: [{ sessionId: 'sess-1', running: listCalls < 2 }] }); }
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint === 'workspace/follow') {
+      send({ type: 'item', streamId: frame.streamId, value: baseline([wksp('ws1', 'T', ['sess-1'])]) });
+    } else if (frame.endpoint === 'session/follow') {
+      if (!prompted) { send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: {} }) }); return; }
+      send({
+        type: 'item', streamId: frame.streamId,
+        value: snapshot([
+          { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+          { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'preset done' }] } } },
+        ], { values: {} }),
+      });
+    }
+  });
+  try {
+    const res = await runCli(['run', 'do it', '--agent-preset', 'minimal', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.strictEqual(createRequest.agentPreset, 'minimal', 'the preset must ride session/create');
+    assert.match(res.err, /preset: minimal/, 'the resolved preset is reported back');
+    assert.match(res.out, /preset done/);
+  } finally {
+    server.close();
+  }
+});
+
+test('run --agent-preset: omitted presets are not sent, so the deployment default applies', async () => {
+  let createRequest = null;
+  let prompted = false;
+  let listCalls = 0;
+  const { server, port } = await startMock((r) => {
+    switch (r.method) {
+      case 'permissionPresets/catalog':
+        return ok({ options: [{ value: 'workspace-write', name: 'workspace-write' }] });
+      case 'session/create': { createRequest = r.args.request; return ok({ sessionId: 'sess-1' }); }
+      case 'session/prompt': prompted = true; return ok(null);
+      case 'session/list': { listCalls++; return ok({ items: [{ sessionId: 'sess-1', running: listCalls < 2 }] }); }
+      default: return ok(null);
+    }
+  }, (frame, send) => {
+    if (frame.endpoint === 'workspace/follow') {
+      send({ type: 'item', streamId: frame.streamId, value: baseline([wksp('ws1', 'T', ['sess-1'])]) });
+    } else if (frame.endpoint === 'session/follow') {
+      if (!prompted) { send({ type: 'item', streamId: frame.streamId, value: snapshot([], { values: {} }) }); return; }
+      send({
+        type: 'item', streamId: frame.streamId,
+        value: snapshot([
+          { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+          { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
+        ], { values: {} }),
+      });
+    }
+  });
+  try {
+    const res = await runCli(['run', 'do it', '--timeout', '5'], { DSH_URL: `http://127.0.0.1:${port}` });
+    assert.strictEqual(res.code, 0);
+    assert.ok(!('agentPreset' in createRequest), 'no preset flag means no agentPreset key at all');
   } finally {
     server.close();
   }
@@ -1507,6 +1699,24 @@ test('auth: an unsigned request is rejected by the server (401) with an auth hin
     assert.strictEqual(res.code, 1);
     assert.match(res.err, /not authenticated|transport failure 401|unauthorized/u);
     assert.match(res.err, /browser-auth cookie/);
+  } finally {
+    server.close();
+  }
+});
+
+test('auth: a stale credential on a mux command reports the auth hint, not "is the web UI running?"', async () => {
+  const { server, port } = await startMock(() => ok(null));
+  try {
+    // `workspaces` reads the mux, whose upgrade is rejected with a bare error
+    // event carrying no status. The CLI probes the unary route to tell a stale
+    // credential apart from a dead server instead of guessing.
+    const res = await runCli(['workspaces'], {
+      DSH_URL: `http://127.0.0.1:${port}`,
+      DSH_AUTH_SECRET: crypto.randomBytes(32).toString('base64url'),
+    });
+    assert.strictEqual(res.code, 1);
+    assert.match(res.err, /not authenticated/u);
+    assert.match(res.err, /browser-auth cookie/u);
   } finally {
     server.close();
   }

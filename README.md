@@ -28,6 +28,14 @@ dsh's web UI is a React client over a local HTTP RPC bridge plus a WebSocket
 mux. `dsh-rpc` speaks that same bridge, so it gets the web UI's grouping
 behavior without needing a browser or any screen-capture permission.
 
+The alternatives really are closed, not merely inconvenient (checked against
+0.1.6): the workspace registry is mounted only in the web bundle, so every other
+profile creates a session with a `cwd` and nothing else; and the tempting hybrid
+— *group* a session through `/api`, then *drive* it with
+`dsh --profile headless --session-id` — is refused in code, because web sessions
+record an agent preset that the one-shot runner does not compose. It is `/api` or
+nothing.
+
 ## Requirements
 
 - **Node.js 22+** (uses the built-in `WebSocket` client for `/api/remote.mux`; tested on Node 24).
@@ -64,6 +72,8 @@ dsh-rpc sessions                        list sessions
 dsh-rpc run <task…> [opts]              create a grouped session, send task, wait, print result
       --workspace,-w <path>             target workspace dir (default: cwd; matched by real path,
                                         so symlinked spellings of the project folder resolve)
+      --agent-preset <id>               agent preset for the new session (e.g. standard, ptc,
+                                        minimal, cordis; deployment-defined)
       --permission,-p <mode>            set+verify the session permission before the task
                                         (default: workspace-write for task runs)
                                         read-only | workspace-write | danger-full-access
@@ -88,13 +98,19 @@ dsh-rpc prompt <sessionId> [opts] <text…>  send a follow-up to an existing ses
       --timeout <sec>                   max wait, then cancel (default 600)
       --task-file --job-id <id> --json --poll-ms <ms>
 dsh-rpc fork <sessionId> [<text…>] [opts]  branch an existing session (child keeps workspace grouping)
-      --at-seq <n>                      cut the branch at a specific history seq (optional)
+      --at-seq <n>                      fork at the END of the completed turn containing event n;
+                                        the child seeds that turn inclusive and nothing after it.
+                                        Omitted or past the end = last completed turn; a turn
+                                        that has not completed is an error
       --no-wait --permission,-p <mode> --model <model> --timeout <sec> --quiet
       --task-file --job-id <id> --json --poll-ms <ms>
 dsh-rpc search <query>                  search the deployment's session history
 dsh-rpc status <sessionId>              print structured JSON evidence about a session
+                                        (running, permission, plan, agentPreset, modelSelection,
+                                        goal, pendingApproval, turnEndReason, outcome, text)
 dsh-rpc cancel <sessionId>              explicitly cancel a session
-dsh-rpc history <sessionId>             print a session's messages
+dsh-rpc history <sessionId>             print a session's messages (user turns, injected context
+                                        labelled by source, assistant turns, tool results)
 dsh-rpc call <method> [json]            raw RPC escape hatch
 dsh-rpc version|--version|-V            print the version and repository
 ```
@@ -136,6 +152,10 @@ dsh-rpc run "add a CHANGELOG entry" --permission workspace-write
 # Inspect
 dsh-rpc sessions
 dsh-rpc history session-xxxx
+dsh-rpc status session-xxxx
+
+# Run a stripped-down agent (presets change the whole toolset, not just a prompt)
+dsh-rpc run "fix the failing test" --agent-preset minimal
 
 # Raw RPC
 dsh-rpc call session/list '{"_request":{}}'
@@ -168,15 +188,43 @@ Notes:
   `fork <text>` apply + verify `workspace-write` unless `--permission`
   overrides it. This pins unattended task execution below dsh's own default
   for new sessions (on this deployment, `danger-full-access`).
-- The requested preset is **validated against the deployment's**
-  `permissions.options` before it is applied, so a preset the deployment doesn't
-  define is rejected up front (instead of relying on a hardcoded list).
+- The requested preset is **validated against the deployment's own catalog**
+  before it is applied, so a preset the deployment doesn't define is rejected up
+  front (instead of relying on a hardcoded list). The catalog is read from
+  `permissionPresets/catalog` on dsh ≥ 0.1.6 and from the session's
+  `permissions` projection (`options`) on 0.1.5 and earlier — see
+  [Compatibility](#compatibility).
+- On dsh ≥ 0.1.6 the validation happens **before the session is created**, so a
+  typo'd preset costs nothing; on older builds it happens as soon as the new
+  session can be asked.
 - The chosen preset is applied via `commands/execute` and **verified** against
   the session's `permissions` projection before the task is submitted; a
   mismatch aborts the run.
-- To see the presets a deployment actually offers: attempt a run with any
-  `--permission` value — the "not offered" rejection lists the exact names this
-  deployment defines (read from the session's `permissions` projection).
+- To see the presets a deployment actually offers, either read the "not offered"
+  rejection (it lists the exact names) or ask directly:
+  `dsh-rpc call permissionPresets/catalog '{}'`.
+
+## Agent presets
+
+`run --agent-preset <id>` picks the agent preset for a new session. A preset
+changes the agent's whole composition — its toolset, not just a prompt — so it is
+a bigger lever than it looks. Typical ids on a stock deployment:
+
+| Preset | What it is |
+|--------|------------|
+| `standard` | Full coding agent: file editing, shell, search, skills, plan, goal, subagents, workflow |
+| `ptc` | Same capabilities, but tools are reached through a programmatic-tool-calling SDK |
+| `minimal` | A single persistent-shell tool |
+| `cordis` | Standard plus runtime inspection and plugin/preset authoring |
+
+Which presets exist is deployment-defined: `dsh-rpc` passes the id straight to
+`session/create`, and dsh rejects an unknown one with its own message. Omit the
+flag for the deployment default. The preset the session actually got is echoed
+on stderr and is visible in `status` as `agentPreset`.
+
+```sh
+dsh-rpc call agentPresets/list '{}'   # discover the ids this deployment defines
+```
 
 ## Output & exit codes
 
@@ -197,9 +245,17 @@ server needed. The mock enforces browser-auth the way the real server does, so
 the suite covers cookie minting/verification, the RPC envelope, trailing-slash
 `DSH_URL`, `--timeout`/missing-value validation, completion detection, the
 approval → cancel path, the non-completed terminal-reason gate,
-deployment-aware `--permission` validation, the shared `run`/`prompt`
-completion path, `fork`, `search`, `--model` resolution (bare id, ambiguity,
-and `--provider` validation), and auth-failure guidance.
+deployment-aware `--permission` validation (both the 0.1.6 catalog path and the
+≤ 0.1.5 projection fallback), the shared `run`/`prompt` completion path, `fork`,
+`search`, `history`, `--agent-preset`, `--model` resolution (bare id, ambiguity,
+and `--provider` validation), `status` projections, and auth-failure guidance.
+
+**The mock models the server version it claims to.** A mock that encodes an old
+projection shape certifies a server that no longer exists — which is exactly how
+the 0.1.6 permission-catalog regression slipped through. Permission tests
+therefore declare which build they model: `permissionPresets/catalog` plus a
+`{currentValue}`-only projection for 0.1.6, or a 404 on that route plus an
+`{options, currentValue}` projection for 0.1.5 and earlier.
 
 ## How it works
 
@@ -208,7 +264,9 @@ plus one WebSocket stream mux. Unary methods are HTTP POSTs to
 `/api/<namespace>/<method>` with `Content-Type: application/json`; the payload
 must carry exactly one `args` object whose keys match the server's generated
 parameter wire names (`request` for most verbs, `_request` for `session/list`,
-`agentId`/`line`/`images` for `commands/execute`):
+`agentId`/`line`/`submittedAttachments` for `commands/execute`). A verb the
+server does not have answers **404 at the transport layer**, with no error
+envelope — that is the signal dsh-rpc uses to feature-detect newer verbs:
 
 ```jsonc
 // request
@@ -232,24 +290,40 @@ connection. Requires Node 22+ for the built-in WebSocket client.
 `v1.<b64url(JSON)>.<HMAC-SHA256>` over
 `{version:1, authority, issuedAt, expiresAt}`. dsh-rpc mints that cookie from
 the signing secret in `~/.dsh/.credentials.yaml` (record
-`client-connection/browser-session`) or `DSH_AUTH_SECRET`; a missing/invalid
-credential produces a clear error before anything reaches the server. The
-server additionally enforces the **browser-trust fence** (loopback or trusted
-host).
+`client-connection/browser-session`) or `DSH_AUTH_SECRET`; a missing credential
+produces a clear error before anything reaches the server. The server
+additionally enforces the **browser-trust fence** (loopback or trusted host).
 
-Methods used here: `workspace/create`, `workspace/delete`, `workspace/follow`
-(stream baseline; replaces the old `workspace.list`), `session/create` (passing
-`workspaceId` attaches/groups the session), `session/prompt` (client-minted
-`requestId`), `session/list` (carries the `running` flag), `session/follow`
-(stream journal snapshot + projections; replaces `session.history`),
-`session/fork` (branching), `session/search`, `session/modelCatalog` +
-`session/selectModel` (`--model`), `session/cancel`, and `commands/execute`
-(permission presets).
+A **stale** credential is the awkward case: the mux upgrade is rejected with a
+bare WebSocket error carrying no HTTP status, so a wrong secret and a dead server
+look identical at the socket. When the mux fails to connect, dsh-rpc probes the
+unary route — which *does* carry a status — and reports what it finds, so a
+rotated secret reads as `not authenticated (401)` instead of a misleading
+"is the web UI running?".
+
+Methods used here: `workspace/create`, `workspace/follow` (stream baseline;
+replaces the old `workspace.list`), `session/create` (passing `workspaceId`
+attaches/groups the session), `session/prompt` (client-minted `requestId`),
+`session/list` (carries the `running` flag), `session/follow` (stream journal
+snapshot + projections; replaces `session.history`), `session/fork` (branching),
+`session/search`, `session/modelCatalog` + `session/selectModel` (`--model`),
+`session/cancel`, `commands/execute` (permission presets), and
+`permissionPresets/catalog` (preset discovery; absent before 0.1.6, which is
+detected rather than assumed).
+
+**Event payloads are not uniform**, and getting this wrong fails silently.
+`user/message` carries the message *directly* on `event.data`;
+`assistant/message` and `tool/result` wrap theirs under `event.data.message`;
+`turn/end` carries `data.reason.kind`; `permission/preset` carries `data.preset`;
+`approval/asked`/`approval/decided` pair on `data.id`. `history` labels
+non-`user`-sourced `user/message` events as injected context, because the loop
+routes system-prompt additions, skill catalogues and notices through the same
+event type as operator input.
 
 **Completion detection** polls `session/list` for the session's `running`
 flag, then reads the final assistant message from the `session/follow` snapshot
-(which also carries the `permissions` projection used by the permission
-verify/drift guards).
+(which also carries the `permissions`, `plan`, `agentPreset`, `modelSelection`
+and `goal` projections used by the permission guards and by `status`).
 
 ## Safety features
 
@@ -257,9 +331,12 @@ These opt-in guards harden unattended runs. They are additive — the default
 `run`/`prompt` behavior is unchanged.
 
 - **Permission control** (`--permission`). The preset is checked against the
-  deployment's `permissions.options`, applied through `commands/execute`
-  (`/permission <mode>`) and **verified** against the session's `permissions`
-  projection before the task is submitted. `danger-full-access` additionally
+  deployment's preset catalog — `permissionPresets/catalog` where the build
+  exposes it (0.1.6+), else the session's `permissions` projection `options` —
+  applied through `commands/execute` (`/permission <mode>`) and **verified**
+  against the session's `permissions` projection before the task is submitted.
+  On 0.1.6+ the catalog check runs before the session is created, so a bad
+  preset costs nothing. `danger-full-access` additionally
   requires `--allow-danger-full-access`.
 - **Permission-drift detection.** While waiting, if the session's permission
   changes away from the one you requested (with `--permission`), the session is
@@ -283,9 +360,9 @@ These opt-in guards harden unattended runs. They are additive — the default
 |---------|--------------------|
 | `cannot reach dsh at http://127.0.0.1:3080` | The dsh web server isn't running. Start it with `dsh web` (or `npm exec @deepseek-ai/dsh web`), or point `DSH_URL` at the right address. |
 | `no dsh web credential available` | The signing secret wasn't found. Run `dsh web` once to create `~/.dsh/.credentials.yaml`, or set `DSH_AUTH_SECRET` (base64url). |
-| `not authenticated for <endpoint> (401)` | The secret doesn't match the server's (e.g. `~/dsh/.credentials.yaml` is stale after a server reinstall). Re-run `dsh web` to re-mint it, or set `DSH_AUTH_SECRET` to the server's current secret. |
-| `permission "<mode>" is not offered by this deployment` | The preset isn't in this deployment's `permissions.options`. Attempt a run with any `--permission` value — the rejection lists the exact preset names. |
-| `could not set permission "<mode>"` | The `/permission` command was rejected. Presets are deployment config — see the preset names via the same rejection message. |
+| `not authenticated for <endpoint> (401)` | The secret doesn't match the server's (e.g. `~/.dsh/.credentials.yaml` is stale after a server reinstall). Re-run `dsh web` to re-mint it, or set `DSH_AUTH_SECRET` to the server's current secret. On a mux-based command (`workspaces`, `history`, `status`) dsh-rpc reports this by probing the unary route, because a rejected WebSocket upgrade carries no status. |
+| `permission "<mode>" is not offered by this deployment` | The preset isn't in the deployment's catalog. The message lists the exact names this deployment defines. |
+| `could not set permission "<mode>"` | The `/permission` command itself rejected the preset. Presets are deployment config — the rejection text names the available ones. |
 | `permission verification failed` | The `/permission` command was accepted but the projection didn't reach the expected value. Re-run, or inspect `dsh-rpc history <id>`. |
 | `session ended with reason "<x>" (not completed)` | The turn did not finish cleanly (e.g. it was cancelled or errored). See `dsh-rpc history <id>`. |
 | `requested approval …; cancelled` | The session hit an approval prompt while unattended; the guard cancelled it. Re-run with a wider preset if the action is expected. |
@@ -299,8 +376,12 @@ These opt-in guards harden unattended runs. They are additive — the default
   snapshots; there is no live token stream (the mux journal is intentionally
   consumed snapshot-by-snapshot).
 - **The old `(0.1.1-rc.2 and earlier) dot-method surface is no longer
-  supported.** dsh-rpc 0.3.0 targets the 0.1.2+ authed, namespaced surface
+  supported.** dsh-rpc 0.4.0 targets the 0.1.2+ authed, namespaced surface
   exclusively.
+- **The `/api` bridge is unversioned upstream.** dsh publishes no wire version,
+  no deprecation policy, and no compatibility promise for it — dsh-rpc lives on
+  feature detection and a verified-version record, not a contract. See
+  [Compatibility](#compatibility).
 - **Workspace matching resolves symlinks.** Both the target path and each
   registered workspace path are realpath'd before comparison, so `/tmp/x`
   finds the workspace registered as `/private/tmp/x` (macOS). Creation passes
@@ -308,6 +389,29 @@ These opt-in guards harden unattended runs. They are additive — the default
 - **`run` always starts a fresh session.** Use `prompt <sessionId>` to continue
   an existing one, or `fork <sessionId>` to branch off it into a new session.
 - **A running dsh web server is required** for every command.
+
+## Compatibility
+
+dsh-rpc sits on `/api`, the web GUI's own wire, which dsh does **not** version,
+publish, or promise to keep stable — the top-level project README warns that
+breaking changes will land during developer preview. Two consequences shape how
+this tool is built:
+
+- **It feature-detects; it never reads a version.** There is no server version
+  string on the wire to read. Where a capability moved between releases, dsh-rpc
+  asks for the new thing and falls back on the transport-level 404 that an
+  absent verb returns. The permission catalog is the worked example:
+  `permissionPresets/catalog` on 0.1.6+, the session `permissions` projection
+  `options` on 0.1.5 and earlier.
+- **It records what was verified, not what is assumed.** The section below names
+  the build each release was exercised against. "Shape-compatible" is not the
+  same as "behaviour-compatible": the permission-catalog change was a silent
+  data-shape move that no request/response diff would have shown.
+
+If a future dsh release mounts the workspace registry outside the web profile —
+or lets headless or the SDK attach a session to a workspace — the reason to
+exist for the `/api` route disappears and this tool should migrate. Until then,
+grouping is reachable only through `/api`.
 
 ## Credits
 
@@ -318,8 +422,38 @@ contributed "guarded runner" proposal
 
 ## Verified against
 
+- **dsh 0.1.6-alpha.1** (`~/Desktop/Developer/deepseek-harness`, source tree at
+  `dsh-v0.1.6-alpha.1-5-g0d1f50007f`; the `dsh-v0.1.6-alpha.2` tag was also read
+  for the diff), verified live 2026-09-19 (dsh-rpc 0.4.0). All 12 RPCs'
+  request/response shapes, the `client-request`/`server-response` envelope, the
+  browser-auth cookie, and the `/api/remote.mux` framing are **byte-identical**
+  to 0.1.5-rc.2 — the whole `session-controller/src/types.ts` diff for the jump
+  is three additive hunks (`session/writer-held` added, `SkillEntry.path` added,
+  `session/control` queue types removed). Two behaviour changes did land, and
+  both are handled:
+  - **`permissions` projection dropped `options`** (moved to the new
+    `permissionPresets/catalog` Remote). This silently disabled dsh-rpc's
+    deployment pre-check; it now reads the catalog, and validates *before*
+    creating a session when the catalog is available.
+  - **`session/fork` cut point.** `atSeq` now seeds exactly the turn containing
+    the anchor (`boundary.seq + 1`) instead of sweeping the following
+    between-turn events — including a queued input the old cut could carry into
+    the child — into the seed. Documented under `--at-seq`.
+  - Also fixed in this release, found while auditing event shapes against
+    0.1.6: `history` had **never** printed user turns (it read `data.message` on
+    a `user/message` event, whose data *is* the message). Every release since
+    0.1.2 was affected; the mock encoded the same wrong assumption, so no test
+    caught it.
+  - Live-verified: `workspaces`, `sessions`, `run` (prompt → completion gate →
+    final text), `--permission` apply+verify, fail-fast preset rejection with no
+    session created, `history`, `status`, `fork`, `cancel`, `search`, and the
+    stale-credential / unreachable-server / unknown-session failure paths.
+    `npm test` 51/51.
+  - Alpha.2-only, **not** yet handled (absent at alpha.1): the `session/writer-held`
+    error code, and `session/control` losing its queue frames / `session/updateQueue`
+    resolving cold agents — the latter two unused by dsh-rpc.
 - dsh 0.1.5-rc.2 (`~/Desktop/Developer/deepseek-harness`, master), verified live
-  2026-09-11 (dsh-rpc 0.3.1): the full wire surface is unchanged through the
+  2026-09-11 (dsh-rpc 0.3.1): the wire surface was unchanged through the
   0.1.2 → 0.1.5 jump — browser-auth cookies, `/api/<ns>/<m>` routes with
   `{args}` payloads and the `client-request`/`server-response` envelope,
   `/api/remote.mux` framing (`workspace/follow` baseline `value.items`,

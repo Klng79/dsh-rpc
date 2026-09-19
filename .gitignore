@@ -3,6 +3,7 @@ node_modules/
 *.log
 
 # Local agent tooling config
+.scratch/
 .claude/
 .qwen/
 AGENTS.md
